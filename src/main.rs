@@ -440,6 +440,18 @@ fn cmd_apollo(args: ApolloArgs) -> Result<()> {
     let (major, minor) = apollo.usb_api_version()?;
     println!("USB API:   {major}.{minor}");
 
+    match apollo.read_idcode() {
+        Ok(idcode) => {
+            let known = if idcode == usbmagic::flash::ECP5_12F_IDCODE {
+                " (ECP5 LFE5U-12F)"
+            } else {
+                ""
+            };
+            println!("JTAG IDCODE: {idcode:#010x}{known}");
+        }
+        Err(e) => println!("JTAG IDCODE: <error: {e}>"),
+    }
+
     if args.reconfigure {
         eprintln!("Reconfiguring FPGA from flash (restoring previous gateware)...");
         apollo.reconfigure()?;

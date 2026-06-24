@@ -25,6 +25,28 @@ use nusb::MaybeFuture;
 
 use crate::error::{Error, Result};
 
+/// JTAG IDCODE of the Cynthion's ECP5 (LFE5U-12F).
+pub const ECP5_12F_IDCODE: u32 = 0x2111_1043;
+
+/// Apollo's JTAG-over-USB vendor requests and TAP state numbers.
+/// (Ported from Great Scott Gadgets' Apollo `jtag.py`.)
+#[allow(dead_code)] // some requests are used by the upcoming configure() path
+mod jtag {
+    pub const REQUEST_JTAG_START: u8 = 0xbf;
+    pub const REQUEST_JTAG_STOP: u8 = 0xbe;
+    pub const REQUEST_JTAG_CLEAR_OUT_BUFFER: u8 = 0xb0;
+    pub const REQUEST_JTAG_SET_OUT_BUFFER: u8 = 0xb1;
+    pub const REQUEST_JTAG_GET_IN_BUFFER: u8 = 0xb2;
+    pub const REQUEST_JTAG_SCAN: u8 = 0xb3;
+    pub const REQUEST_JTAG_RUN_CLOCK: u8 = 0xb4;
+    pub const REQUEST_JTAG_GO_TO_STATE: u8 = 0xb5;
+    pub const REQUEST_JTAG_GET_INFO: u8 = 0xb8;
+
+    // TAP FSM state numbers (subset).
+    pub const STATE_RESET: u16 = 0;
+    pub const STATE_DRSHIFT: u16 = 4;
+}
+
 /// USB vendor ID shared by Cynthion/Apollo.
 pub const VID: u16 = 0x1d50;
 /// Apollo debug stub (board ready to be programmed).
@@ -148,9 +170,18 @@ impl Apollo {
 
     fn from_info(info: &nusb::DeviceInfo) -> Result<Apollo> {
         let device = info.open().wait()?;
-        // Control transfers are issued through a claimed interface; Apollo's
-        // debug interface is interface 0.
-        let interface = device.claim_interface(0).wait()?;
+        // EP0 device-recipient control transfers work through any claimed
+        // interface, but Apollo's interfaces 0/1 are CDC-ACM and held by the
+        // kernel `cdc_acm` driver. Claim a non-CDC interface (the DFU/vendor one)
+        // to avoid an "interface busy" error.
+        let iface_num = info
+            .interfaces()
+            .map(|f| (f.interface_number(), f.class()))
+            .filter(|(_, class)| !matches!(class, 0x02 | 0x0a))
+            .map(|(n, _)| n)
+            .min()
+            .unwrap_or(0);
+        let interface = device.claim_interface(iface_num).wait()?;
         Ok(Apollo {
             _device: device,
             interface,
@@ -206,6 +237,64 @@ impl Apollo {
             return Err(Error::Protocol("short USB API version response".into()));
         }
         Ok((data[0], data[1]))
+    }
+
+    /// Low-level Apollo vendor OUT request (recipient = device).
+    fn out_req(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
+        self.interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request,
+                    value,
+                    index,
+                    data,
+                },
+                TIMEOUT,
+            )
+            .wait()?;
+        Ok(())
+    }
+
+    /// Low-level Apollo vendor IN request (recipient = device).
+    fn in_req(&self, request: u8, value: u16, index: u16, length: u16) -> Result<Vec<u8>> {
+        Ok(self
+            .interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request,
+                    value,
+                    index,
+                    length,
+                },
+                TIMEOUT,
+            )
+            .wait()?)
+    }
+
+    /// Read the JTAG IDCODE of the attached FPGA.
+    ///
+    /// Resets the TAP (which loads the IDCODE instruction), scans 32 DR bits, and
+    /// returns them. For the Cynthion's ECP5 LFE5U-12F this is [`ECP5_12F_IDCODE`].
+    /// Drives JTAG over Apollo's vendor-request protocol (ported from GSG Apollo).
+    pub fn read_idcode(&self) -> Result<u32> {
+        self.out_req(jtag::REQUEST_JTAG_START, 0, 0, &[])?;
+        // Force the TAP to RESET (loads IDCODE), then into DRSHIFT.
+        self.out_req(jtag::REQUEST_JTAG_GO_TO_STATE, jtag::STATE_RESET, 0, &[])?;
+        self.out_req(jtag::REQUEST_JTAG_GO_TO_STATE, jtag::STATE_DRSHIFT, 0, &[])?;
+        self.out_req(jtag::REQUEST_JTAG_CLEAR_OUT_BUFFER, 0, 0, &[])?;
+        // Scan 32 bits (no state advance), then read the 4 captured bytes.
+        self.out_req(jtag::REQUEST_JTAG_SCAN, 32, 0, &[])?;
+        let buf = self.in_req(jtag::REQUEST_JTAG_GET_IN_BUFFER, 0, 0, 4)?;
+        self.out_req(jtag::REQUEST_JTAG_STOP, 0, 0, &[])?;
+        if buf.len() < 4 {
+            return Err(Error::Protocol("short JTAG IDCODE response".into()));
+        }
+        // Bits are captured LSB-first into the buffer -> little-endian value.
+        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the

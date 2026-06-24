@@ -1,3 +1,3 @@
 # Source gateware version for the vendored bitstream(s) in this directory.
 # Updated by scripts/pull-gateware.sh; format: <repo> <git-sha-or-tag> <date>.
-KarpelesLab/usbmagic-gateware d68dab2fdc06 (ci-run 28094993489) 2026-06-24T11:26:11Z
+KarpelesLab/usbmagic-gateware 9b4911d136cb (ci-run 28114127048) 2026-06-24T16:39:05Z

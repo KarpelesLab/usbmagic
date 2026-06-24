@@ -757,11 +757,22 @@ impl Apollo {
         })
     }
 
-    /// Set the pd_bridge VBUS load-switch register (see the [`vbus`] constants).
-    /// Routes VBUS between ports via the shared TARGET-A rail.
-    pub fn set_vbus_switches(&self, bits: u8) -> Result<()> {
+    /// Set the pd_bridge VBUS load switches (see the [`vbus`] constants), routing
+    /// VBUS between ports via the shared TARGET-A rail.
+    ///
+    /// The switch state rides on the TARGET-C command register (the only register
+    /// path that reliably captures the written word in this gateware): `CMD_SET_VBUS`
+    /// plus the switch bits in `cmd[31:24]`. The gateware mirrors the latched value
+    /// back into the TARGET-C status register's bits[23:16], which we read to verify.
+    /// Returns the switch state read back from the status register (bits[23:16]),
+    /// which the caller can compare against `bits` to confirm the latch.
+    pub fn set_vbus_switches(&self, bits: u8) -> Result<u8> {
         self.with_registers(|a, iw, dw| {
-            a.meta_txn(REG_VBUS, true, u32::from(bits), iw, dw).map(|_| ())
+            let word = CMD_SET_VBUS | (u32::from(bits) << 24);
+            a.meta_txn(REG_TC_CMD, true, word, iw, dw)?;
+            // Read back the latched switches from the status register's high bits.
+            let status = a.meta_txn(REG_TC_STATUS, false, 0, iw, dw)?;
+            Ok(((status >> 16) & 0xFF) as u8)
         })
     }
 
@@ -846,7 +857,10 @@ const REG_TC_CMD: u8 = 2;
 const REG_TC_STATUS: u8 = 3;
 const REG_AUX_CMD: u8 = 5;
 const REG_AUX_STATUS: u8 = 6;
-const REG_VBUS: u8 = 7;
+
+/// TARGET-C command-register flag: latch `cmd[31:24]` as the VBUS switches.
+/// (VBUS control rides on this register; see [`Apollo::set_vbus_switches`].)
+const CMD_SET_VBUS: u32 = 1 << 5;
 
 /// VBUS load-switch bits for [`Apollo::set_vbus_switches`]. Each connects a port's
 /// VBUS to the shared TARGET-A rail.
@@ -860,6 +874,10 @@ pub mod vbus {
     pub const AUX: u8 = 1 << 2;
     /// Discharge the TARGET-A rail.
     pub const TARGET_A_DISCHARGE: u8 = 1 << 3;
+    /// Release the AUX port's input shutoff (let the AUX supply's VBUS into the board).
+    pub const AUX_IN: u8 = 1 << 4;
+    /// Release the CONTROL port's input shutoff (let host VBUS into the board).
+    pub const CONTROL_IN: u8 = 1 << 5;
 }
 
 /// Which Cynthion Type-C port (FUSB302B) to drive via the pd_bridge gateware.

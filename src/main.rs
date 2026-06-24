@@ -751,9 +751,18 @@ fn cmd_charge() -> Result<()> {
         eprintln!("TARGET-C presenting source (Rp) on CC{tc_cc}.");
     }
 
-    // 3. Route AUX 5 V -> TARGET-A rail -> TARGET-C. Never enable CONTROL (host).
-    apollo.set_vbus_switches(vbus::AUX | vbus::TARGET_C)?;
-    eprintln!("Routed AUX 5 V -> TARGET-C.");
+    // 3. Route AUX 5 V into the board and out to TARGET-C via the TARGET-A rail.
+    //    AUX_IN releases the AUX input shutoff; never enable CONTROL (host).
+    let want = vbus::AUX_IN | vbus::AUX | vbus::TARGET_C;
+    let got = apollo.set_vbus_switches(want)?;
+    if got == want {
+        eprintln!("Routed AUX 5 V -> TARGET-C (VBUS switches {want:#04x}, read-back verified).");
+    } else {
+        eprintln!(
+            "Set VBUS switches to {want:#04x} (status read-back {got:#04x}); continuing — \
+             VBUS presence is checked below."
+        );
+    }
     std::thread::sleep(Duration::from_millis(100));
 
     // 4. Confirm VBUS reached TARGET-C.

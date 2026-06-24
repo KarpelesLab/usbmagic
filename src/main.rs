@@ -38,6 +38,9 @@ enum Command {
     /// Flash the PD bridge, set the FUSB302B as a sink, and decode PD messages
     /// from a source on TARGET-C.
     PdListen(PdListenArgs),
+    /// Act as a PD source: advertise Source_Capabilities to a consumer on
+    /// TARGET-C and decode its replies.
+    PdSource(PdListenArgs),
 }
 
 #[derive(Args)]
@@ -113,6 +116,33 @@ struct PdListenArgs {
     /// How long to listen for PD messages, in seconds.
     #[arg(short = 't', long, default_value_t = 5.0)]
     duration: f64,
+
+    /// Which Cynthion Type-C port's FUSB302B to use.
+    #[arg(long, value_enum, default_value_t = PortArg::TargetC)]
+    port: PortArg,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum PortArg {
+    #[value(name = "target-c")]
+    TargetC,
+    Aux,
+}
+
+impl From<PortArg> for usbmagic::flash::PdLine {
+    fn from(p: PortArg) -> Self {
+        match p {
+            PortArg::TargetC => usbmagic::flash::PdLine::TargetC,
+            PortArg::Aux => usbmagic::flash::PdLine::Aux,
+        }
+    }
+}
+
+fn port_name(p: PortArg) -> &'static str {
+    match p {
+        PortArg::TargetC => "TARGET-C",
+        PortArg::Aux => "AUX",
+    }
 }
 
 #[derive(Args)]
@@ -132,6 +162,7 @@ fn main() -> Result<()> {
         Command::Apollo(args) => cmd_apollo(args),
         Command::PdProbe => cmd_pd_probe(),
         Command::PdListen(args) => cmd_pd_listen(args),
+        Command::PdSource(args) => cmd_pd_source(args),
     }
 }
 
@@ -508,7 +539,7 @@ fn cmd_pd_probe() -> Result<()> {
 
 fn probe_fusb302_id(apollo: &usbmagic::flash::Apollo) {
     // Read the FUSB302B Device ID register (I2C 0x22, reg 0x01) over bit-banged I2C.
-    match apollo.fusb302_read_register(0x22, 0x01) {
+    match apollo.fusb302_read_register(usbmagic::flash::PdLine::TargetC, 0x22, 0x01) {
         Ok(id) => println!(
             "FUSB302B DeviceID (reg 0x01) = {id:#04x}  (version {:#x}, rev {:#x}){}",
             (id >> 4) & 0xf,
@@ -532,12 +563,14 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
     apollo.configure_sram(&bitstream)?;
     std::thread::sleep(Duration::from_millis(200));
 
-    let cc = apollo.fusb302_setup_sink()?;
+    let line = usbmagic::flash::PdLine::from(args.port);
+    let port = port_name(args.port);
+    let cc = apollo.fusb302_setup_sink(line)?;
     if cc == 0 {
-        bail!("no USB-C source detected on TARGET-C (CC lines idle) — plug a charger/source into TARGET-C");
+        bail!("no USB-C source detected on {port} (CC lines idle) — plug a charger/source into {port}");
     }
     eprintln!(
-        "FUSB302B set as sink on CC{cc}; listening {:.0}s for PD messages...",
+        "FUSB302B set as sink on {port} CC{cc}; listening {:.0}s for PD messages...",
         args.duration
     );
     let rp_name = |bc: u8| match bc {
@@ -546,7 +579,7 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
         2 => "1.5 A @ 5 V",
         _ => "3.0 A @ 5 V",
     };
-    let s0 = apollo.fusb302_read_register(0x22, 0x40).unwrap_or(0);
+    let s0 = apollo.fusb302_read_register(line, 0x22, 0x40).unwrap_or(0);
     eprintln!(
         "  STATUS0 = {s0:#04x}  VBUS={}, source Rp = {}, BMC activity={}",
         if (s0 >> 7) & 1 == 1 { "present" } else { "absent" },
@@ -556,36 +589,106 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
 
     let start = Instant::now();
     let mut count = 0u32;
-    let mut activity_seen = (s0 >> 6) & 1 == 1;
-    let mut max_bc = s0 & 0x03;
-    let mut last_status = Instant::now();
+    // Accumulate the FUSB302B INTERRUPT (0x42) latches across the run — these
+    // catch brief PD events that periodic STATUS0 sampling would miss.
+    let mut irq_seen = 0u8;
     while start.elapsed().as_secs_f64() < args.duration {
-        match apollo.fusb302_poll_message()? {
+        irq_seen |= apollo.fusb302_read_register(line, 0x22, 0x42).unwrap_or(0);
+        match apollo.fusb302_poll_message(line)? {
             Some(raw) => {
                 count += 1;
                 print_pd_message(count, start.elapsed().as_secs_f64(), &PdMessage { raw });
             }
-            None => std::thread::sleep(Duration::from_millis(15)),
-        }
-        // Continuously watch for any BMC activity / a higher advertised Rp.
-        if last_status.elapsed() >= Duration::from_millis(200) {
-            last_status = Instant::now();
-            let s = apollo.fusb302_read_register(0x22, 0x40).unwrap_or(0);
-            activity_seen |= (s >> 6) & 1 == 1;
-            max_bc = max_bc.max(s & 0x03);
+            None => std::thread::sleep(Duration::from_millis(10)),
         }
     }
+    // INTERRUPT bits: I_CRC_CHK (0x10) = good PD message received; I_ACTIVITY
+    // (0x40) = BMC activity seen; I_BC_LVL (0x01) = CC level changed.
     eprintln!(
-        "Done — {count} PD message(s) captured. (max Rp seen: {}, any BMC activity: {})",
-        rp_name(max_bc),
-        if activity_seen { "yes" } else { "no" },
+        "Done — {count} PD message(s) captured. (latched INTERRUPT bits: {irq_seen:#04x} — \
+         CRC_CHK={}, ACTIVITY={}, BC_LVL={})",
+        (irq_seen >> 4) & 1,
+        (irq_seen >> 6) & 1,
+        irq_seen & 1,
     );
-    if count == 0 && !activity_seen {
+    if count == 0 {
+        if irq_seen & 0x10 != 0 {
+            eprintln!("Note: good PD messages were received (CRC_CHK latched) but the FIFO read returned none — RX-decode bug; I'll fix it.");
+        } else if irq_seen & 0x40 != 0 {
+            eprintln!("Note: BMC activity seen but no good CRC — messages are arriving garbled (wrong CC polarity or SpecRev).");
+        } else {
+            eprintln!("No BMC activity at all: this source isn't transmitting USB-PD on the measured CC (Type-C current only, or wrong port).");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_pd_source(args: PdListenArgs) -> Result<()> {
+    use std::time::{Duration, Instant};
+    use usbmagic::flash::Apollo;
+    use usbmagic::PdMessage;
+
+    let path = "firmware/usbmagic-pd-bridge.bit";
+    let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+
+    let apollo = Apollo::open().context("opening Apollo")?;
+    eprintln!("Flashing pd_bridge ({} bytes)...", bitstream.len());
+    apollo.configure_sram(&bitstream)?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    let line = usbmagic::flash::PdLine::from(args.port);
+    let port = port_name(args.port);
+    let cc = apollo.fusb302_setup_source(line)?;
+    if cc == 0 {
+        bail!("no PD consumer (sink) detected on {port} — is the device plugged into {port}?");
+    }
+    let s0 = apollo.fusb302_read_register(line, 0x22, 0x40).unwrap_or(0);
+    eprintln!(
+        "FUSB302B set as source on CC{cc} (VBUS {}); advertising Source_Capabilities for {:.0}s...",
+        if (s0 >> 7) & 1 == 1 { "present" } else { "ABSENT" },
+        args.duration
+    );
+    if (s0 >> 7) & 1 == 0 {
         eprintln!(
-            "No PD traffic: the source supplies VBUS but never drove the CC line (no BMC). \
-             That's a non-PD / default-USB source. A USB-C PD charger advertises 1.5/3.0 A Rp \
-             and sends Source_Capabilities — if you have one on TARGET-C and still see this, \
-             say so and I'll dig into the FUSB302B receiver config."
+            "  warning: VBUS not detected — a sink won't negotiate without VBUS. \
+             (Current pd_bridge gateware can't switch VBUS; that's the next gateware addition.)"
+        );
+    }
+
+    // Source_Capabilities: header (data msg type 1, source, DFP, Rev2.0, 1 PDO) +
+    // one Fixed PDO: 5 V @ 1.5 A.
+    const PDO_5V_1A5: u32 = (100 << 10) | 150; // 50 mV & 10 mA units
+    let start = Instant::now();
+    let mut msg_id = 0u16;
+    let mut got = 0u32;
+    while start.elapsed().as_secs_f64() < args.duration {
+        let header: u16 = 0x1161 | ((msg_id & 0x7) << 9);
+        let mut raw = header.to_le_bytes().to_vec();
+        raw.extend_from_slice(&PDO_5V_1A5.to_le_bytes());
+        if let Err(e) = apollo.fusb302_tx(line, &raw) {
+            eprintln!("TX error: {e}");
+        }
+        msg_id = msg_id.wrapping_add(1);
+
+        // Listen for replies (GoodCRC, Request, …) for a short window.
+        let window = Instant::now();
+        while window.elapsed() < Duration::from_millis(300)
+            && start.elapsed().as_secs_f64() < args.duration
+        {
+            match apollo.fusb302_poll_message(line)? {
+                Some(r) => {
+                    got += 1;
+                    print_pd_message(got, start.elapsed().as_secs_f64(), &PdMessage { raw: r });
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+    eprintln!("Done — {got} PD message(s) received from the consumer.");
+    if got == 0 {
+        eprintln!(
+            "No reply. If VBUS is present and the device is a PD sink on TARGET-C, this may be a \
+             CC-orientation or receiver detail — tell me and I'll iterate."
         );
     }
     Ok(())

@@ -600,17 +600,19 @@ impl Apollo {
 
     /// Read a register from an I2C device behind the pd_bridge gateware
     /// (bit-banged over the GPIO registers, whole transaction in one JTAG session).
-    pub fn fusb302_read_register(&self, dev_addr: u8, reg: u8) -> Result<u8> {
+    pub fn fusb302_read_register(&self, line: PdLine, dev_addr: u8, reg: u8) -> Result<u8> {
+        let regs = line.gpio_regs();
         self.with_registers(|a, iw, dw| {
-            let mut bus = I2cBus::new(a, iw, dw);
+            let mut bus = I2cBus::new(a, iw, dw, regs);
             bus.read_reg(dev_addr, reg)
         })
     }
 
     /// Write a register to an I2C device behind the pd_bridge gateware.
-    pub fn fusb302_write_register(&self, dev_addr: u8, reg: u8, value: u8) -> Result<()> {
+    pub fn fusb302_write_register(&self, line: PdLine, dev_addr: u8, reg: u8, value: u8) -> Result<()> {
+        let regs = line.gpio_regs();
         self.with_registers(|a, iw, dw| {
-            let mut bus = I2cBus::new(a, iw, dw);
+            let mut bus = I2cBus::new(a, iw, dw, regs);
             bus.write_reg(dev_addr, reg, value)
         })
     }
@@ -619,19 +621,22 @@ impl Apollo {
     /// detect CC orientation, present Rd, and enable BMC receive with hardware
     /// AUTO_CRC. After this, received PD messages accumulate in the RX FIFO.
     /// Returns the detected CC line (1 or 2), or 0 if nothing is attached.
-    pub fn fusb302_setup_sink(&self) -> Result<u8> {
+    pub fn fusb302_setup_sink(&self, line: PdLine) -> Result<u8> {
         use fusb302::*;
-        self.fusb302_write_register(ADDR, REG_RESET, 0x01)?; // SW_RES: reset everything
+        let w = |reg, val| self.fusb302_write_register(line, ADDR, reg, val);
+        let r = |reg| self.fusb302_read_register(line, ADDR, reg);
+
+        w(REG_RESET, 0x01)?; // SW_RES: reset everything
         std::thread::sleep(Duration::from_millis(10));
-        self.fusb302_write_register(ADDR, REG_POWER, 0x0F)?; // power all internal blocks
+        w(REG_POWER, 0x0F)?; // power all internal blocks
 
         // Present Rd on both CC and measure each to find the attached one.
-        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC1)?;
+        w(REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC1)?;
         std::thread::sleep(Duration::from_millis(2));
-        let bc1 = self.fusb302_read_register(ADDR, REG_STATUS0)? & 0x03;
-        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC2)?;
+        let bc1 = r(REG_STATUS0)? & 0x03;
+        w(REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC2)?;
         std::thread::sleep(Duration::from_millis(2));
-        let bc2 = self.fusb302_read_register(ADDR, REG_STATUS0)? & 0x03;
+        let bc2 = r(REG_STATUS0)? & 0x03;
 
         let cc = if bc1 == 0 && bc2 == 0 {
             return Ok(0); // nothing attached / no source pull-up seen
@@ -648,20 +653,80 @@ impl Apollo {
         } else {
             (MEAS_CC2, TXCC2)
         };
-        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | meas)?;
-        self.fusb302_write_register(ADDR, REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0)?;
-        self.fusb302_write_register(ADDR, REG_CONTROL0, 0x00)?;
-        self.fusb302_write_register(ADDR, REG_CONTROL1, RX_FLUSH)?;
+        w(REG_SWITCHES0, PDWN1 | PDWN2 | meas)?;
+        w(REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0)?;
+        w(REG_CONTROL0, 0x00)?;
+        w(REG_CONTROL1, RX_FLUSH)?;
         Ok(cc)
+    }
+
+    /// Configure the FUSB302B as a USB-PD **source**: reset, power up, present Rp,
+    /// detect the sink's CC, advertise 1.5 A, and enable BMC TX/RX with AUTO_CRC.
+    /// VBUS must already be present on TARGET-C. Returns the active CC (1/2), or 0
+    /// if no sink is detected.
+    pub fn fusb302_setup_source(&self, line: PdLine) -> Result<u8> {
+        use fusb302::*;
+        let w = |reg, val| self.fusb302_write_register(line, ADDR, reg, val);
+        let r = |reg| self.fusb302_read_register(line, ADDR, reg);
+
+        w(REG_RESET, 0x01)?;
+        std::thread::sleep(Duration::from_millis(10));
+        w(REG_POWER, 0x0F)?;
+        w(REG_CONTROL0, HOST_CUR_1A5)?;
+
+        // Present Rp on both CC and find the attached one: the sink's Rd pulls its
+        // CC below the comparator threshold (COMP=0); the open CC stays high (COMP=1).
+        w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC1)?;
+        std::thread::sleep(Duration::from_millis(2));
+        let comp1 = r(REG_STATUS0)? & COMP;
+        w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC2)?;
+        std::thread::sleep(Duration::from_millis(2));
+        let comp2 = r(REG_STATUS0)? & COMP;
+
+        let cc = if comp1 == 0 {
+            1
+        } else if comp2 == 0 {
+            2
+        } else {
+            return Ok(0); // no sink pulling either CC down
+        };
+
+        let (pu, meas, txcc) = if cc == 1 {
+            (PU_EN1, MEAS_CC1, TXCC1)
+        } else {
+            (PU_EN2, MEAS_CC2, TXCC2)
+        };
+        w(REG_SWITCHES0, pu | meas)?;
+        w(REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0 | POWERROLE | DATAROLE)?;
+        w(REG_CONTROL1, RX_FLUSH)?;
+        Ok(cc)
+    }
+
+    /// Transmit one PD message (raw = 2-byte header + data objects) as SOP, with
+    /// the FUSB302B computing the CRC and BMC-encoding it.
+    pub fn fusb302_tx(&self, line: PdLine, raw: &[u8]) -> Result<()> {
+        use fusb302::*;
+        let regs = line.gpio_regs();
+        // FIFO token stream: SOP ordered set, PACKSYM|len, payload, JAM_CRC, EOP,
+        // TXOFF, TXON.
+        let mut seq = vec![TX_SOP1, TX_SOP1, TX_SOP1, TX_SOP2, TX_PACKSYM | (raw.len() as u8)];
+        seq.extend_from_slice(raw);
+        seq.extend_from_slice(&[TX_JAM_CRC, TX_EOP, TX_OFF, TX_ON]);
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw, regs);
+            bus.write_reg(ADDR, REG_CONTROL0, HOST_CUR_1A5 | TX_FLUSH)?; // flush TX FIFO
+            bus.write_reg_multi(ADDR, REG_FIFOS, &seq)
+        })
     }
 
     /// Poll the FUSB302B RX FIFO for one received PD message. Returns the raw
     /// message bytes (2-byte header + data objects, little-endian; CRC stripped),
     /// or `None` if the FIFO is empty / the next token isn't a packet.
-    pub fn fusb302_poll_message(&self) -> Result<Option<Vec<u8>>> {
+    pub fn fusb302_poll_message(&self, line: PdLine) -> Result<Option<Vec<u8>>> {
         use fusb302::*;
+        let regs = line.gpio_regs();
         self.with_registers(|a, iw, dw| {
-            let mut bus = I2cBus::new(a, iw, dw);
+            let mut bus = I2cBus::new(a, iw, dw, regs);
             // RX_EMPTY (STATUS1 bit5) set => nothing to read.
             if bus.read_reg(ADDR, REG_STATUS1)? & 0x20 != 0 {
                 return Ok(None);
@@ -725,19 +790,60 @@ mod fusb302 {
     pub const MEAS_CC1: u8 = 1 << 2;
     pub const MEAS_CC2: u8 = 1 << 3;
 
+    // SWITCHES0 source bits.
+    pub const PU_EN1: u8 = 1 << 6; // present Rp on CC1 (source)
+    pub const PU_EN2: u8 = 1 << 7; // present Rp on CC2 (source)
+
     // SWITCHES1 bits.
     pub const TXCC1: u8 = 1 << 0;
     pub const TXCC2: u8 = 1 << 1;
     pub const AUTO_CRC: u8 = 1 << 2;
+    pub const DATAROLE: u8 = 1 << 4; // 1 = DFP
     pub const SPECREV_2_0: u8 = 0b01 << 5;
+    pub const POWERROLE: u8 = 1 << 7; // 1 = source
+
+    // CONTROL0 bits.
+    pub const HOST_CUR_1A5: u8 = 0b10 << 2; // advertise 1.5 A via Rp
+    pub const TX_FLUSH: u8 = 1 << 6;
 
     // CONTROL1 bits.
     pub const RX_FLUSH: u8 = 1 << 2;
+
+    // STATUS0 bits.
+    pub const COMP: u8 = 1 << 5; // measured CC above the MDAC threshold
+
+    // TX FIFO tokens.
+    pub const TX_SOP1: u8 = 0x12;
+    pub const TX_SOP2: u8 = 0x13;
+    pub const TX_PACKSYM: u8 = 0x80; // | byte_count
+    pub const TX_JAM_CRC: u8 = 0xFF;
+    pub const TX_EOP: u8 = 0x14;
+    pub const TX_OFF: u8 = 0xFE;
+    pub const TX_ON: u8 = 0xA1;
 }
 
 // pd_bridge gateware register map.
-const REG_GPIO_OUT: u8 = 2; // bit0 = SCL level, bit1 = SDA drive-low
-const REG_GPIO_IN: u8 = 3; // bit0 = SDA line, bit1 = FUSB302B INT#
+const REG_GPIO_OUT: u8 = 2; // TARGET-C: bit0 = SCL level, bit1 = SDA drive-low
+const REG_GPIO_IN: u8 = 3; // TARGET-C: bit0 = SDA line, bit1 = FUSB302B INT#
+const REG_AUX_GPIO_OUT: u8 = 5; // AUX: same layout
+const REG_AUX_GPIO_IN: u8 = 6;
+
+/// Which Cynthion Type-C port (FUSB302B) to drive via the pd_bridge gateware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdLine {
+    TargetC,
+    Aux,
+}
+
+impl PdLine {
+    /// (GPIO-out register, GPIO-in register) for this port.
+    fn gpio_regs(self) -> (u8, u8) {
+        match self {
+            PdLine::TargetC => (REG_GPIO_OUT, REG_GPIO_IN),
+            PdLine::Aux => (REG_AUX_GPIO_OUT, REG_AUX_GPIO_IN),
+        }
+    }
+}
 
 /// Bit-banged I2C master over the pd_bridge GPIO registers. Lives inside a single
 /// [`Apollo::with_registers`] session so every SCL/SDA edge reuses one JTAG
@@ -747,25 +853,29 @@ struct I2cBus<'a> {
     iw: usize,
     dw: usize,
     out: u32,
+    reg_out: u8,
+    reg_in: u8,
 }
 
 impl<'a> I2cBus<'a> {
     const SCL: u32 = 0b01;
     const SDA_LOW: u32 = 0b10;
 
-    fn new(a: &'a Apollo, iw: usize, dw: usize) -> Self {
+    fn new(a: &'a Apollo, iw: usize, dw: usize, regs: (u8, u8)) -> Self {
         // Idle: SCL high, SDA released.
         I2cBus {
             a,
             iw,
             dw,
             out: Self::SCL,
+            reg_out: regs.0,
+            reg_in: regs.1,
         }
     }
 
     fn apply(&self) -> Result<()> {
         self.a
-            .meta_txn(REG_GPIO_OUT, true, self.out, self.iw, self.dw)
+            .meta_txn(self.reg_out, true, self.out, self.iw, self.dw)
             .map(|_| ())
     }
 
@@ -789,7 +899,7 @@ impl<'a> I2cBus<'a> {
     }
 
     fn read_sda(&self) -> Result<bool> {
-        Ok(self.a.meta_txn(REG_GPIO_IN, false, 0, self.iw, self.dw)? & 1 == 1)
+        Ok(self.a.meta_txn(self.reg_in, false, 0, self.iw, self.dw)? & 1 == 1)
     }
 
     fn start(&mut self) -> Result<()> {
@@ -885,6 +995,21 @@ impl<'a> I2cBus<'a> {
         }
         self.stop()?;
         Ok(out)
+    }
+
+    /// Write `bytes` sequentially starting at `reg` (e.g. filling a TX FIFO).
+    fn write_reg_multi(&mut self, dev_addr: u8, reg: u8, bytes: &[u8]) -> Result<()> {
+        self.start()?;
+        let mut ok = self.write_byte(dev_addr << 1)? && self.write_byte(reg)?;
+        for b in bytes {
+            ok &= self.write_byte(*b)?;
+        }
+        self.stop()?;
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Protocol(format!("I2C burst write to {dev_addr:#04x} not ACKed")))
+        }
     }
 
     fn write_reg(&mut self, dev_addr: u8, reg: u8, value: u8) -> Result<()> {

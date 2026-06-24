@@ -973,12 +973,21 @@ fn source_contract(
     msg_id: &mut u16,
 ) -> Result<bool> {
     use std::time::{Duration, Instant};
-    for _ in 0..10 {
+    for attempt in 0..5 {
         let caps = PdMessage::from_objects(source_header(1, pdos.len() as u16, *msg_id), pdos);
         send_traced(apollo, line, cc, trace, &caps)?;
         *msg_id = msg_id.wrapping_add(1);
+        // Did the partner GoodCRC our Source_Capabilities? (Hardware auto-retry
+        // already retransmitted up to 3× if not.) This is consumed by hardware,
+        // so it won't appear in the trace — report it explicitly.
+        match apollo.fusb302_tx_result(line)? {
+            Some(true) => eprintln!("  (Source_Capabilities #{attempt} ACKed by sink)"),
+            Some(false) => eprintln!("  (Source_Capabilities #{attempt} not ACKed — retries failed)"),
+            None => {}
+        }
+        // Listen quietly for the sink's Request (hardware auto-GoodCRCs it).
         let window = Instant::now();
-        while window.elapsed() < Duration::from_millis(400) {
+        while window.elapsed() < Duration::from_millis(700) {
             if let Some(raw) = apollo.fusb302_poll_message(line)? {
                 let m = PdMessage { raw };
                 let name = usbmagic::pd_message_name(&m);
@@ -1004,7 +1013,10 @@ fn source_contract(
 /// Bring up 5 V VBUS on TARGET-C: prefer an AUX supply, fall back to CONTROL/host
 /// 5 V. Returns a human label for the source used. Only ever 5 V, and AUX/CONTROL
 /// are never on the rail together (no back-feed into the host).
-fn bring_up_vbus_target_c(apollo: &usbmagic::flash::Apollo, mode: VbusArg) -> Result<&'static str> {
+fn bring_up_vbus_target_c(
+    apollo: &usbmagic::flash::Apollo,
+    mode: VbusArg,
+) -> Result<(&'static str, u8)> {
     use std::time::Duration;
     use usbmagic::flash::{vbus, PdLine};
     apollo.set_vbus_switches(0)?;
@@ -1016,8 +1028,9 @@ fn bring_up_vbus_target_c(apollo: &usbmagic::flash::Apollo, mode: VbusArg) -> Re
             for _ in 0..20 {
                 let s = apollo.fusb302_read_register(PdLine::Aux, 0x22, 0x40)?;
                 if (s >> 7) & 1 == 1 {
-                    apollo.set_vbus_switches(vbus::AUX_IN | vbus::AUX | vbus::TARGET_C)?;
-                    return Ok("AUX 5 V");
+                    let bits = vbus::AUX_IN | vbus::AUX | vbus::TARGET_C;
+                    apollo.set_vbus_switches(bits)?;
+                    return Ok(("AUX 5 V", bits));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1027,15 +1040,31 @@ fn bring_up_vbus_target_c(apollo: &usbmagic::flash::Apollo, mode: VbusArg) -> Re
         }
     }
     if try_control {
-        apollo.set_vbus_switches(vbus::CONTROL_IN | vbus::CONTROL | vbus::TARGET_C)?;
+        let bits = vbus::CONTROL_IN | vbus::CONTROL | vbus::TARGET_C;
+        apollo.set_vbus_switches(bits)?;
         std::thread::sleep(Duration::from_millis(150));
         let s = apollo.fusb302_read_register(PdLine::TargetC, 0x22, 0x40).unwrap_or(0);
         if (s >> 7) & 1 == 1 {
-            return Ok("CONTROL / host 5 V");
+            return Ok(("CONTROL / host 5 V", bits));
         }
-        return Ok("CONTROL / host 5 V (VBUS not yet confirmed)");
+        return Ok(("CONTROL / host 5 V (VBUS not yet confirmed)", bits));
     }
     bail!("no VBUS source available (mode {mode:?})");
+}
+
+/// Briefly drop + discharge VBUS on TARGET-C, then re-apply `route`. This forces
+/// a fresh Type-C attach so the sink re-enters PD and expects Source_Capabilities,
+/// letting us send them within tFirstSourceCap (sinks stop expecting PD otherwise).
+fn cycle_vbus_target_c(apollo: &usbmagic::flash::Apollo, route: u8) -> Result<()> {
+    use std::time::Duration;
+    use usbmagic::flash::vbus;
+    // Connect TARGET-C to the rail and discharge it (AUX/CONTROL OFF so nothing
+    // feeds it) — this actually bleeds the device's VBUS to vSafe0V. Discharging
+    // the rail alone with TARGET-C open would leave the device's VBUS cap charged.
+    apollo.set_vbus_switches(vbus::TARGET_C | vbus::TARGET_A_DISCHARGE)?;
+    std::thread::sleep(Duration::from_millis(600));
+    apollo.set_vbus_switches(route)?; // re-apply VBUS
+    Ok(())
 }
 
 /// Decode a hex string (whitespace and `_` allowed) into bytes.
@@ -1096,10 +1125,15 @@ fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
     let port = port_name(args.port);
 
     // PHY role + VBUS.
+    let mut vbus_route = 0u8; // switch bits used to power TARGET-C (for VBUS cycling)
     let cc = match args.role {
         RoleArg::Source => {
+            // VBUS first: a DRP sink (e.g. an iPhone) only presents a stable Rd
+            // once VBUS is applied, so we need it up to detect the CC reliably.
+            // (We then cycle VBUS before negotiating to fix the cap timing.)
             if !matches!(args.vbus, VbusArg::None) && line == PdLine::TargetC {
-                let src = bring_up_vbus_target_c(&apollo, args.vbus)?;
+                let (src, bits) = bring_up_vbus_target_c(&apollo, args.vbus)?;
+                vbus_route = bits;
                 eprintln!("VBUS on TARGET-C via {src}.");
             }
             let cc = apollo.fusb302_setup_source(line)?;
@@ -1125,6 +1159,10 @@ fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
 
     if args.negotiate {
         if matches!(args.role, RoleArg::Source) {
+            if vbus_route != 0 {
+                eprintln!("Cycling VBUS to force a fresh PD attach before negotiating...");
+                cycle_vbus_target_c(&apollo, vbus_route)?;
+            }
             const PDO_5V_1A5: u32 = (100 << 10) | 150;
             if source_contract(&apollo, line, cc, &mut trace, &[PDO_5V_1A5], &mut msg_id)? {
                 eprintln!("Explicit PD contract established.");

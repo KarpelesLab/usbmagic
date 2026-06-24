@@ -629,6 +629,10 @@ impl Apollo {
         w(REG_RESET, 0x01)?; // SW_RES: reset everything
         std::thread::sleep(Duration::from_millis(10));
         w(REG_POWER, 0x0F)?; // power all internal blocks
+        // Hardware GoodCRC auto-retry (PD nRetryCount=3): the chip waits for the
+        // partner's GoodCRC after each TX and retransmits if absent, instead of us
+        // blindly re-sending and colliding with the partner's reply.
+        w(REG_CONTROL3, CONTROL3_RETRY)?;
 
         // Present Rd on both CC and measure each to find the attached one.
         w(REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC1)?;
@@ -680,6 +684,8 @@ impl Apollo {
         w(REG_RESET, 0x01)?;
         std::thread::sleep(Duration::from_millis(10));
         w(REG_POWER, 0x0F)?;
+        // Hardware GoodCRC auto-retry (PD nRetryCount=3) — see fusb302_setup_sink.
+        w(REG_CONTROL3, CONTROL3_RETRY)?;
         w(REG_CONTROL0, HOST_CUR_1A5)?;
 
         // Present Rp on both CC and find the attached one: the sink's Rd pulls its
@@ -727,6 +733,23 @@ impl Apollo {
             bus.write_reg(ADDR, REG_CONTROL0, c0 | TX_FLUSH)?;
             bus.write_reg_multi(ADDR, REG_FIFOS, &seq)
         })
+    }
+
+    /// After a transmit, read the GoodCRC result from INTERRUPTA (read-clear):
+    /// `Some(true)` if the partner ACKed (TX_SUCCESS), `Some(false)` if all
+    /// hardware auto-retries failed (RETRYFAIL), `None` if neither is set yet.
+    /// With AUTO_RETRY this is how the PD spec's "did my message get through?"
+    /// is answered — the partner's GoodCRC is consumed by hardware, not the FIFO.
+    pub fn fusb302_tx_result(&self, line: PdLine) -> Result<Option<bool>> {
+        use fusb302::*;
+        let a = self.fusb302_read_register(line, ADDR, REG_INTERRUPTA)?;
+        if a & TX_SUCCESS != 0 {
+            Ok(Some(true))
+        } else if a & RETRYFAIL != 0 {
+            Ok(Some(false))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Poll the FUSB302B RX FIFO for one received PD message. Returns the raw
@@ -807,9 +830,12 @@ mod fusb302 {
     pub const REG_MEASURE: u8 = 0x04;
     pub const REG_CONTROL0: u8 = 0x06;
     pub const REG_CONTROL1: u8 = 0x07;
+    pub const REG_CONTROL3: u8 = 0x09;
     pub const REG_POWER: u8 = 0x0B;
     pub const REG_RESET: u8 = 0x0C;
     pub const REG_STATUS0: u8 = 0x40;
+    pub const REG_STATUS0A: u8 = 0x3C;
+    pub const REG_INTERRUPTA: u8 = 0x3E;
     pub const REG_STATUS1: u8 = 0x41;
     pub const REG_FIFOS: u8 = 0x43;
 
@@ -837,6 +863,15 @@ mod fusb302 {
 
     // CONTROL1 bits.
     pub const RX_FLUSH: u8 = 1 << 2;
+
+    // CONTROL3 bits: hardware GoodCRC auto-retry (the PD spec's nRetryCount).
+    pub const AUTO_RETRY: u8 = 1 << 0;
+    pub const N_RETRIES_3: u8 = 0x6; // bits[2:1] = 3 retries
+    pub const CONTROL3_RETRY: u8 = N_RETRIES_3 | AUTO_RETRY;
+
+    // INTERRUPTA bits (read-clear).
+    pub const TX_SUCCESS: u8 = 1 << 2; // GoodCRC received for our transmitted message
+    pub const RETRYFAIL: u8 = 1 << 4; // all auto-retries failed (no GoodCRC)
 
     // STATUS0 bits.
     pub const COMP: u8 = 1 << 5; // measured CC above the MDAC threshold

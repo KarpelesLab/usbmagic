@@ -77,6 +77,33 @@ for item in dev.start_capture(opts)?.take(10) {
 # Ok::<(), usbmagic::Error>(())
 ```
 
+### Host / PD / power capability traits (in progress)
+
+Toward the forensics-host goal (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), the
+crate defines capability traits independent of the analyzer:
+
+- `host::UsbHost` — drive a downstream device: `set_vbus`, `bus_reset`, `control_transfer`,
+  `transfer`, `enumerate`, and the forensic `raw_transaction` (emit non-compliant traffic)
+  + a `poll_events` wire log.
+- `pd::PowerDelivery` — CC status, VCONN, raw PD message/VDM send/recv, controller registers.
+- `power::PowerMonitor` — per-port VBUS voltage/current.
+
+These have **no gateware yet**, but a `mock::MockHost` implements all three against a
+simulated device so host-side code can be built and tested today:
+
+```rust
+use usbmagic::{mock::MockHost, UsbHost};
+
+let mut host = MockHost::new();
+host.set_vbus(true)?;
+let dev = host.enumerate()?; // reset → addr 0 desc head → SET_ADDRESS → full descriptor
+println!("{:04x}:{:04x}", dev.device_descriptor.vendor_id, dev.device_descriptor.product_id);
+# Ok::<(), usbmagic::Error>(())
+```
+
+The CONTROL-port wire protocol that real gateware will speak is drafted in
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
+
 ### Adding a backend
 
 Devices are abstracted by the `MagicDevice` trait and registered as a `Backend`

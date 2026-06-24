@@ -150,6 +150,10 @@ HS bulk rates — a real risk to budget for).
 
 ## 5. Control / command protocol (CONTROL port)
 
+> The wire protocol is specified in **[PROTOCOL.md](PROTOCOL.md)** (v0 draft). The
+> Rust-side capability traits and a software mock already exist (see §6) and are
+> tested against that mapping, so the host stack can be developed before gateware.
+
 Two designs, chosen pragmatically:
 
 - **(a) Fixed-function gateware + vendor control/bulk** — exactly the style this crate
@@ -197,6 +201,15 @@ Forensics features layered on top:
 
 Until gateware exists, the Rust host stack is developed against (i) an **Amaranth/cocotb
 simulation** of the gateware and (ii) a **software mock** of the command protocol.
+
+**Implemented now (software-only, no gateware required):** the capability traits
+`UsbHost` (`src/host`), `PowerDelivery` (`src/pd`), `PowerMonitor` (`src/power`), the
+forensic primitives (`Pid`, `Setup`, `RawTransaction`/`TxFlags`, `WireEvent`,
+`BusError`, `DeviceDescriptor`), a default `enumerate()`, and a `MockHost` (`src/mock`)
+with a simulated device. `MagicDevice` gained `as_host()` / `power_delivery()` /
+`power_monitor()` accessors (default `None`) so the Cynthion backend can expose these
+once host gateware lands. All covered by unit tests, incl. enumerating the mock device
+and confirming forensic anomalies (e.g. corrupt-CRC) are reported, not hidden.
 
 ## 7. Forensic design tenets
 

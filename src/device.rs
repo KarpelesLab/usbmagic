@@ -70,6 +70,23 @@ pub trait MagicDevice {
 
     /// Start a capture session with the given options.
     fn start_capture(&mut self, options: CaptureOptions) -> Result<CaptureStream>;
+
+    /// Access this device as a USB **host** (drive a downstream device), if it
+    /// supports host mode. Defaults to `None`; backends that gain host gateware
+    /// override it.
+    fn as_host(&mut self) -> Option<&mut dyn crate::host::UsbHost> {
+        None
+    }
+
+    /// Access this device's USB **Power Delivery** capability, if any.
+    fn power_delivery(&mut self) -> Option<&mut dyn crate::pd::PowerDelivery> {
+        None
+    }
+
+    /// Access this device's per-port **power monitor**, if any.
+    fn power_monitor(&mut self) -> Option<&mut dyn crate::power::PowerMonitor> {
+        None
+    }
 }
 
 /// A device found on the bus that a backend can open.

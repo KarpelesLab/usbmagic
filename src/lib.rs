@@ -31,8 +31,17 @@ pub mod backend;
 pub mod capture;
 pub mod device;
 pub mod error;
+pub mod host;
+pub mod mock;
 pub mod pcap;
+pub mod pd;
+pub mod power;
 
 pub use capture::{CaptureData, CaptureItem, CaptureOptions, CaptureStream, Speed, StopFn};
 pub use device::{discover, Capabilities, DeviceDescription, Discovered, MagicDevice, State};
 pub use error::{Error, Result};
+pub use host::{
+    DeviceDescriptor, Direction, EnumeratedDevice, Handshake, Pid, RawTransaction, Setup, UsbHost,
+};
+pub use pd::{PdMessage, PdPort, PowerDelivery, Vdm};
+pub use power::{MonitoredPort, PortPower, PowerMonitor};

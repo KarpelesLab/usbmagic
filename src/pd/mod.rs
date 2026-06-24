@@ -129,6 +129,23 @@ impl Pdo {
     pub fn fixed_max_current_ma(self) -> Option<u32> {
         self.is_fixed().then(|| (self.raw & 0x3FF) * 10)
     }
+
+    /// True if this is an Augmented PDO (APDO), e.g. a PPS supply (bits 30–31 == 0b11).
+    pub fn is_augmented(self) -> bool {
+        (self.raw >> 30) & 0x3 == 0b11
+    }
+
+    /// If this is a PPS (SPR Programmable Power Supply) APDO, returns
+    /// `(min_mv, max_mv, max_ma)`. PPS is APDO subtype 0 (bits 28–29 == 0).
+    pub fn pps(self) -> Option<(u32, u32, u32)> {
+        if !self.is_augmented() || (self.raw >> 28) & 0x3 != 0 {
+            return None;
+        }
+        let max_mv = ((self.raw >> 17) & 0xFF) * 100; // 100 mV units
+        let min_mv = ((self.raw >> 8) & 0xFF) * 100; // 100 mV units
+        let max_ma = (self.raw & 0x7F) * 50; // 50 mA units
+        Some((min_mv, max_mv, max_ma))
+    }
 }
 
 /// A Vendor-Defined Message (structured VDM), the primary vehicle for custom PD.

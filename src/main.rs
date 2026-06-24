@@ -589,18 +589,29 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
 
     let start = Instant::now();
     let mut count = 0u32;
-    // Accumulate the FUSB302B INTERRUPT (0x42) latches across the run — these
-    // catch brief PD events that periodic STATUS0 sampling would miss.
     let mut irq_seen = 0u8;
-    while start.elapsed().as_secs_f64() < args.duration {
+    let mut got_caps = false;
+    // Bit-banged I2C is slow, so drive this by passes (and stop on success)
+    // rather than a wall clock the I2C would blow past. Each pass: solicit, then
+    // drain every message currently in the RX FIFO.
+    let max_passes = (args.duration.max(1.0) * 3.0) as u32; // ~3 passes/sec budget
+    for _pass in 0..max_passes {
         irq_seen |= apollo.fusb302_read_register(line, 0x22, 0x42).unwrap_or(0);
-        match apollo.fusb302_poll_message(line)? {
-            Some(raw) => {
-                count += 1;
-                print_pd_message(count, start.elapsed().as_secs_f64(), &PdMessage { raw });
+
+        // Drain the whole RX FIFO this pass (GoodCRC + Source_Capabilities arrive
+        // back-to-back).
+        while let Some(raw) = apollo.fusb302_poll_message(line)? {
+            count += 1;
+            let msg = PdMessage { raw };
+            if pd_message_name(&msg) == "Source_Capabilities" {
+                got_caps = true;
             }
-            None => std::thread::sleep(Duration::from_millis(10)),
+            print_pd_message(count, start.elapsed().as_secs_f64(), &msg);
         }
+        if got_caps {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
     // INTERRUPT bits: I_CRC_CHK (0x10) = good PD message received; I_ACTIVITY
     // (0x40) = BMC activity seen; I_BC_LVL (0x01) = CC level changed.
@@ -741,14 +752,23 @@ fn print_pd_message(index: u32, ts: f64, msg: &usbmagic::PdMessage) {
     if pd_message_name(msg) == "Source_Capabilities" {
         for (i, o) in msg.objects().iter().enumerate() {
             let pdo = Pdo { raw: *o };
-            match (pdo.fixed_voltage_mv(), pdo.fixed_max_current_ma()) {
-                (Some(mv), Some(ma)) => println!(
+            if let (Some(mv), Some(ma)) = (pdo.fixed_voltage_mv(), pdo.fixed_max_current_ma()) {
+                println!(
                     "       PDO{}: {:.2} V @ {:.2} A (fixed)",
                     i + 1,
                     mv as f64 / 1000.0,
                     ma as f64 / 1000.0
-                ),
-                _ => println!("       PDO{}: {o:#010x}", i + 1),
+                );
+            } else if let Some((min_mv, max_mv, max_ma)) = pdo.pps() {
+                println!(
+                    "       PDO{}: {:.2}–{:.2} V @ {:.2} A (PPS)",
+                    i + 1,
+                    min_mv as f64 / 1000.0,
+                    max_mv as f64 / 1000.0,
+                    max_ma as f64 / 1000.0
+                );
+            } else {
+                println!("       PDO{}: {o:#010x}", i + 1);
             }
         }
     }

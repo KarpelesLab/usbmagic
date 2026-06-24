@@ -653,10 +653,18 @@ impl Apollo {
         } else {
             (MEAS_CC2, TXCC2)
         };
-        w(REG_SWITCHES0, PDWN1 | PDWN2 | meas)?;
         w(REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0)?;
         w(REG_CONTROL0, 0x00)?;
-        w(REG_CONTROL1, RX_FLUSH)?;
+        w(REG_CONTROL1, RX_FLUSH)?; // clear any stale RX BEFORE the re-attach
+
+        // Force a fresh attach so a quiescent source re-emits its unsolicited
+        // Source_Capabilities burst: present open (detach), then re-present Rd.
+        // AUTO_CRC acks the incoming caps in hardware, and the RX FIFO keeps the
+        // oldest message on overflow, so we can read the first caps at our own
+        // (slow) pace afterwards — do NOT flush again here.
+        w(REG_SWITCHES0, 0x00)?;
+        std::thread::sleep(Duration::from_millis(700));
+        w(REG_SWITCHES0, PDWN1 | PDWN2 | meas)?;
         Ok(cc)
     }
 
@@ -714,7 +722,9 @@ impl Apollo {
         seq.extend_from_slice(&[TX_JAM_CRC, TX_EOP, TX_OFF, TX_ON]);
         self.with_registers(|a, iw, dw| {
             let mut bus = I2cBus::new(a, iw, dw, regs);
-            bus.write_reg(ADDR, REG_CONTROL0, HOST_CUR_1A5 | TX_FLUSH)?; // flush TX FIFO
+            // Flush the TX FIFO without disturbing the role bits (HOST_CUR etc.).
+            let c0 = bus.read_reg(ADDR, REG_CONTROL0)?;
+            bus.write_reg(ADDR, REG_CONTROL0, c0 | TX_FLUSH)?;
             bus.write_reg_multi(ADDR, REG_FIFOS, &seq)
         })
     }

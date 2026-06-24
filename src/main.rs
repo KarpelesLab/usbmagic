@@ -1177,6 +1177,32 @@ fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
     }
     trace.flush()?;
     eprintln!("Done — {} PD message(s) traced.", trace.count());
+
+    // Diagnostics: was the partner transmitting at all? INTERRUPT (0x42) latches
+    // I_ACTIVITY (BMC seen) and I_CRC_CHK (a good message arrived); STATUS0 0x40.
+    let irq = apollo.fusb302_read_register(line, 0x22, 0x42).unwrap_or(0);
+    let s0 = apollo.fusb302_read_register(line, 0x22, 0x40).unwrap_or(0);
+    eprintln!(
+        "  partner activity: BMC={} goodCRC={}  (INTERRUPT={irq:#04x}, STATUS0={s0:#04x}, \
+         VBUS={})",
+        (irq >> 6) & 1,
+        (irq >> 4) & 1,
+        if (s0 >> 7) & 1 == 1 { "present" } else { "absent" },
+    );
+    if (irq >> 4) & 1 == 0 {
+        if (irq >> 6) & 1 == 1 {
+            eprintln!(
+                "  note: the partner IS transmitting (BMC=1) but no message decoded (goodCRC=0) — \
+                 messages are arriving garbled. Likely CC polarity for RX, SpecRev, or we're \
+                 colliding by transmitting over its replies (INTERRUPT collision bit 0x02)."
+            );
+        } else {
+            eprintln!(
+                "  note: no BMC activity from the partner — it may have fallen back to Type-C 5 V \
+                 before our caps arrived, or isn't running PD on this CC."
+            );
+        }
+    }
     if let Some(d) = &args.dump {
         eprintln!("Wrote pcapng trace to {d} (LINKTYPE_USB_TYPE_C_PD).");
     }

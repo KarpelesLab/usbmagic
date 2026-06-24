@@ -95,9 +95,16 @@ retained in `LICENSE` as required.
 
 ## Roadmap
 
-Not yet implemented, but the backend abstraction leaves room for:
+The larger goal is a **professional USB forensics instrument** that uses the Cynthion as
+a **USB 2.0 host** — driving a device under test directly so it never appears to the
+operator's OS — with custom Power Delivery (PD) messaging and first-class handling of
+non-compliant / broken USB exchanges. This requires custom LUNA/Amaranth FPGA gateware.
 
-- USB-C / Power Delivery (PD) experiments using the Cynthion's USB-C ports.
-- Apollo / FPGA flashing (`1d50:6018`).
-- Facedancer-style USB device emulation.
-- Live USB protocol dissection.
+See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full architecture and phased
+roadmap. In short:
+
+- **Now:** USB 2.0 analyzer capture (this crate).
+- **Next:** custom gateware host controller (FS/LS → HS), Rust host stack, fault
+  injection, PD plane (TARGET-C / AUX, incl. VCONN), power telemetry (PAC1954).
+- **Deferred:** USB 3.0 / SuperSpeed — **not possible on Cynthion hardware** (no
+  SuperSpeed routing); revisit on SS-capable hardware.

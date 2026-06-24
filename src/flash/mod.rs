@@ -615,6 +615,73 @@ impl Apollo {
         })
     }
 
+    /// Configure the FUSB302B (on TARGET-C) as a USB-PD **sink**: reset, power up,
+    /// detect CC orientation, present Rd, and enable BMC receive with hardware
+    /// AUTO_CRC. After this, received PD messages accumulate in the RX FIFO.
+    /// Returns the detected CC line (1 or 2), or 0 if nothing is attached.
+    pub fn fusb302_setup_sink(&self) -> Result<u8> {
+        use fusb302::*;
+        self.fusb302_write_register(ADDR, REG_RESET, 0x01)?; // SW_RES: reset everything
+        std::thread::sleep(Duration::from_millis(10));
+        self.fusb302_write_register(ADDR, REG_POWER, 0x0F)?; // power all internal blocks
+
+        // Present Rd on both CC and measure each to find the attached one.
+        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC1)?;
+        std::thread::sleep(Duration::from_millis(2));
+        let bc1 = self.fusb302_read_register(ADDR, REG_STATUS0)? & 0x03;
+        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC2)?;
+        std::thread::sleep(Duration::from_millis(2));
+        let bc2 = self.fusb302_read_register(ADDR, REG_STATUS0)? & 0x03;
+
+        let cc = if bc1 == 0 && bc2 == 0 {
+            return Ok(0); // nothing attached / no source pull-up seen
+        } else if bc1 >= bc2 {
+            1
+        } else {
+            2
+        };
+
+        // Lock measurement + TX onto the active CC, present Rd, enable AUTO_CRC
+        // (Rev 2.0), and flush the RX FIFO.
+        let (meas, txcc) = if cc == 1 {
+            (MEAS_CC1, TXCC1)
+        } else {
+            (MEAS_CC2, TXCC2)
+        };
+        self.fusb302_write_register(ADDR, REG_SWITCHES0, PDWN1 | PDWN2 | meas)?;
+        self.fusb302_write_register(ADDR, REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0)?;
+        self.fusb302_write_register(ADDR, REG_CONTROL0, 0x00)?;
+        self.fusb302_write_register(ADDR, REG_CONTROL1, RX_FLUSH)?;
+        Ok(cc)
+    }
+
+    /// Poll the FUSB302B RX FIFO for one received PD message. Returns the raw
+    /// message bytes (2-byte header + data objects, little-endian; CRC stripped),
+    /// or `None` if the FIFO is empty / the next token isn't a packet.
+    pub fn fusb302_poll_message(&self) -> Result<Option<Vec<u8>>> {
+        use fusb302::*;
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw);
+            // RX_EMPTY (STATUS1 bit5) set => nothing to read.
+            if bus.read_reg(ADDR, REG_STATUS1)? & 0x20 != 0 {
+                return Ok(None);
+            }
+            // Token + 2-byte header.
+            let head = bus.read_reg_multi(ADDR, REG_FIFOS, 3)?;
+            // RX token: top three bits 0b111 => SOP (a real packet).
+            if head[0] & 0xE0 != 0xE0 {
+                return Ok(None);
+            }
+            let header = u16::from_le_bytes([head[1], head[2]]);
+            let num_obj = ((header >> 12) & 0x7) as usize;
+            // num_obj * 4 data bytes + 4 CRC bytes follow.
+            let rest = bus.read_reg_multi(ADDR, REG_FIFOS, num_obj * 4 + 4)?;
+            let mut raw = vec![head[1], head[2]];
+            raw.extend_from_slice(&rest[..num_obj * 4]);
+            Ok(Some(raw))
+        })
+    }
+
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {
@@ -633,6 +700,39 @@ impl Apollo {
             .wait()?;
         Ok(())
     }
+}
+
+/// FUSB302B USB-C PD controller register/bit definitions (from its datasheet).
+#[allow(dead_code)]
+mod fusb302 {
+    pub const ADDR: u8 = 0x22; // 7-bit I2C address
+
+    pub const REG_DEVICE_ID: u8 = 0x01;
+    pub const REG_SWITCHES0: u8 = 0x02;
+    pub const REG_SWITCHES1: u8 = 0x03;
+    pub const REG_MEASURE: u8 = 0x04;
+    pub const REG_CONTROL0: u8 = 0x06;
+    pub const REG_CONTROL1: u8 = 0x07;
+    pub const REG_POWER: u8 = 0x0B;
+    pub const REG_RESET: u8 = 0x0C;
+    pub const REG_STATUS0: u8 = 0x40;
+    pub const REG_STATUS1: u8 = 0x41;
+    pub const REG_FIFOS: u8 = 0x43;
+
+    // SWITCHES0 bits.
+    pub const PDWN1: u8 = 1 << 0; // CC1 pull-down (sink Rd)
+    pub const PDWN2: u8 = 1 << 1; // CC2 pull-down (sink Rd)
+    pub const MEAS_CC1: u8 = 1 << 2;
+    pub const MEAS_CC2: u8 = 1 << 3;
+
+    // SWITCHES1 bits.
+    pub const TXCC1: u8 = 1 << 0;
+    pub const TXCC2: u8 = 1 << 1;
+    pub const AUTO_CRC: u8 = 1 << 2;
+    pub const SPECREV_2_0: u8 = 0b01 << 5;
+
+    // CONTROL1 bits.
+    pub const RX_FLUSH: u8 = 1 << 2;
 }
 
 // pd_bridge gateware register map.
@@ -765,6 +865,26 @@ impl<'a> I2cBus<'a> {
         let value = self.read_byte(false)?; // single byte -> NACK
         self.stop()?;
         Ok(value)
+    }
+
+    /// Read `n` bytes starting at `reg` (e.g. draining a FIFO register).
+    fn read_reg_multi(&mut self, dev_addr: u8, reg: u8, n: usize) -> Result<Vec<u8>> {
+        self.start()?;
+        if !self.write_byte(dev_addr << 1)? || !self.write_byte(reg)? {
+            self.stop()?;
+            return Err(Error::Protocol(format!("I2C: no ACK addressing {dev_addr:#04x}")));
+        }
+        self.start()?;
+        if !self.write_byte((dev_addr << 1) | 1)? {
+            self.stop()?;
+            return Err(Error::Protocol(format!("I2C: no ACK from {dev_addr:#04x} (read)")));
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(self.read_byte(i + 1 < n)?); // ACK all but the last
+        }
+        self.stop()?;
+        Ok(out)
     }
 
     fn write_reg(&mut self, dev_addr: u8, reg: u8, value: u8) -> Result<()> {

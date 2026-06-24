@@ -35,6 +35,9 @@ enum Command {
     Apollo(ApolloArgs),
     /// Flash the PD-bridge gateware and probe its registers (FUSB302B I2C lines).
     PdProbe,
+    /// Flash the PD bridge, set the FUSB302B as a sink, and decode PD messages
+    /// from a source on TARGET-C.
+    PdListen(PdListenArgs),
 }
 
 #[derive(Args)]
@@ -106,6 +109,13 @@ struct FlashArgs {
 }
 
 #[derive(Args)]
+struct PdListenArgs {
+    /// How long to listen for PD messages, in seconds.
+    #[arg(short = 't', long, default_value_t = 5.0)]
+    duration: f64,
+}
+
+#[derive(Args)]
 struct ApolloArgs {
     /// After reading identity, reconfigure the FPGA from flash (restore gateware).
     #[arg(long)]
@@ -121,6 +131,7 @@ fn main() -> Result<()> {
         Command::Flash(args) => cmd_flash(args),
         Command::Apollo(args) => cmd_apollo(args),
         Command::PdProbe => cmd_pd_probe(),
+        Command::PdListen(args) => cmd_pd_listen(args),
     }
 }
 
@@ -491,6 +502,11 @@ fn cmd_pd_probe() -> Result<()> {
         (gpio_in >> 1) & 1
     );
 
+    probe_fusb302_id(&apollo);
+    Ok(())
+}
+
+fn probe_fusb302_id(apollo: &usbmagic::flash::Apollo) {
     // Read the FUSB302B Device ID register (I2C 0x22, reg 0x01) over bit-banged I2C.
     match apollo.fusb302_read_register(0x22, 0x01) {
         Ok(id) => println!(
@@ -501,5 +517,123 @@ fn cmd_pd_probe() -> Result<()> {
         ),
         Err(e) => println!("FUSB302B read failed: {e}"),
     }
+}
+
+fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
+    use std::time::{Duration, Instant};
+    use usbmagic::flash::Apollo;
+    use usbmagic::PdMessage;
+
+    let path = "firmware/usbmagic-pd-bridge.bit";
+    let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+
+    let apollo = Apollo::open().context("opening Apollo")?;
+    eprintln!("Flashing pd_bridge ({} bytes)...", bitstream.len());
+    apollo.configure_sram(&bitstream)?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    let cc = apollo.fusb302_setup_sink()?;
+    if cc == 0 {
+        bail!("no USB-C source detected on TARGET-C (CC lines idle) — plug a charger/source into TARGET-C");
+    }
+    eprintln!(
+        "FUSB302B set as sink on CC{cc}; listening {:.0}s for PD messages...",
+        args.duration
+    );
+    let mut activity_seen = false;
+    if let Ok(s0) = apollo.fusb302_read_register(0x22, 0x40) {
+        let bc = s0 & 0x03;
+        let rp = match bc {
+            0 => "none/vRa",
+            1 => "default USB (~0.5 A)",
+            2 => "1.5 A @ 5 V",
+            _ => "3.0 A @ 5 V",
+        };
+        activity_seen = (s0 >> 6) & 1 == 1;
+        eprintln!(
+            "  STATUS0 = {s0:#04x}  VBUS={}, source Rp = {rp}, BMC activity={}",
+            if (s0 >> 7) & 1 == 1 { "present" } else { "absent" },
+            activity_seen as u8,
+        );
+    }
+
+    let start = Instant::now();
+    let mut count = 0u32;
+    while start.elapsed().as_secs_f64() < args.duration {
+        match apollo.fusb302_poll_message()? {
+            Some(raw) => {
+                count += 1;
+                print_pd_message(count, start.elapsed().as_secs_f64(), &PdMessage { raw });
+            }
+            None => std::thread::sleep(Duration::from_millis(15)),
+        }
+    }
+    eprintln!("Done — {count} PD message(s) captured.");
+    if count == 0 && !activity_seen {
+        eprintln!(
+            "No PD traffic seen: the attached source supplies VBUS but doesn't run USB-PD \
+             (it only advertises current via the CC resistor). Try a USB-C PD charger/laptop supply."
+        );
+    }
     Ok(())
+}
+
+fn pd_message_name(msg: &usbmagic::PdMessage) -> &'static str {
+    use usbmagic::pd::PdMessageClass;
+    let mt = msg.message_type().unwrap_or(0);
+    match msg.class() {
+        Some(PdMessageClass::Control) => match mt {
+            1 => "GoodCRC",
+            2 => "GotoMin",
+            3 => "Accept",
+            4 => "Reject",
+            5 => "Ping",
+            6 => "PS_RDY",
+            7 => "Get_Source_Cap",
+            8 => "Get_Sink_Cap",
+            9 => "DR_Swap",
+            10 => "PR_Swap",
+            11 => "VCONN_Swap",
+            12 => "Wait",
+            13 => "Soft_Reset",
+            _ => "Control(?)",
+        },
+        Some(PdMessageClass::Data) => match mt {
+            1 => "Source_Capabilities",
+            2 => "Request",
+            3 => "BIST",
+            4 => "Sink_Capabilities",
+            5 => "Battery_Status",
+            6 => "Alert",
+            15 => "Vendor_Defined",
+            _ => "Data(?)",
+        },
+        Some(PdMessageClass::Extended) => "Extended",
+        None => "(empty)",
+    }
+}
+
+fn print_pd_message(index: u32, ts: f64, msg: &usbmagic::PdMessage) {
+    use usbmagic::pd::Pdo;
+    let hex: String = msg.raw.iter().map(|b| format!("{b:02x}")).collect();
+    println!(
+        "#{index:<3} [{ts:7.3}s] {:<20} hdr={:#06x} obj={} raw={hex}",
+        pd_message_name(msg),
+        msg.header().unwrap_or(0),
+        msg.num_data_objects().unwrap_or(0),
+    );
+    if pd_message_name(msg) == "Source_Capabilities" {
+        for (i, o) in msg.objects().iter().enumerate() {
+            let pdo = Pdo { raw: *o };
+            match (pdo.fixed_voltage_mv(), pdo.fixed_max_current_ma()) {
+                (Some(mv), Some(ma)) => println!(
+                    "       PDO{}: {:.2} V @ {:.2} A (fixed)",
+                    i + 1,
+                    mv as f64 / 1000.0,
+                    ma as f64 / 1000.0
+                ),
+                _ => println!("       PDO{}: {o:#010x}", i + 1),
+            }
+        }
+    }
 }

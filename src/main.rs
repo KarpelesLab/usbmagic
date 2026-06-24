@@ -41,6 +41,8 @@ enum Command {
     /// Act as a PD source: advertise Source_Capabilities to a consumer on
     /// TARGET-C and decode its replies.
     PdSource(PdListenArgs),
+    /// Charge a device on TARGET-C at 5 V, sourced from a supply on AUX.
+    Charge,
 }
 
 #[derive(Args)]
@@ -163,6 +165,7 @@ fn main() -> Result<()> {
         Command::PdProbe => cmd_pd_probe(),
         Command::PdListen(args) => cmd_pd_listen(args),
         Command::PdSource(args) => cmd_pd_source(args),
+        Command::Charge => cmd_charge(),
     }
 }
 
@@ -702,6 +705,67 @@ fn cmd_pd_source(args: PdListenArgs) -> Result<()> {
              CC-orientation or receiver detail — tell me and I'll iterate."
         );
     }
+    Ok(())
+}
+
+fn cmd_charge() -> Result<()> {
+    use std::time::Duration;
+    use usbmagic::flash::{vbus, Apollo, PdLine};
+
+    let path = "firmware/usbmagic-pd-bridge.bit";
+    let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+
+    let apollo = Apollo::open().context("opening Apollo")?;
+    eprintln!("Flashing pd_bridge ({} bytes)...", bitstream.len());
+    apollo.configure_sram(&bitstream)?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Safety: start with every VBUS switch open.
+    apollo.set_vbus_switches(0)?;
+
+    // 1. Present a sink on AUX so the supply turns on VBUS. We deliberately do
+    //    NOT send a PD Request, so it stays at the default 5 V.
+    let aux_cc = apollo.fusb302_setup_sink(PdLine::Aux)?;
+    if aux_cc == 0 {
+        bail!("no PD supply detected on AUX — plug the power supply into AUX");
+    }
+    let mut aux_vbus = false;
+    for _ in 0..20 {
+        let s = apollo.fusb302_read_register(PdLine::Aux, 0x22, 0x40)?;
+        if (s >> 7) & 1 == 1 {
+            aux_vbus = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !aux_vbus {
+        bail!("AUX supply did not bring up VBUS");
+    }
+    eprintln!("AUX supply attached; VBUS up at 5 V.");
+
+    // 2. Present a source (Rp) on TARGET-C so the consumer detects a source.
+    let tc_cc = apollo.fusb302_setup_source(PdLine::TargetC)?;
+    if tc_cc == 0 {
+        eprintln!("warning: no sink detected on TARGET-C (is the device plugged in?) — routing VBUS anyway");
+    } else {
+        eprintln!("TARGET-C presenting source (Rp) on CC{tc_cc}.");
+    }
+
+    // 3. Route AUX 5 V -> TARGET-A rail -> TARGET-C. Never enable CONTROL (host).
+    apollo.set_vbus_switches(vbus::AUX | vbus::TARGET_C)?;
+    eprintln!("Routed AUX 5 V -> TARGET-C.");
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 4. Confirm VBUS reached TARGET-C.
+    let s = apollo.fusb302_read_register(PdLine::TargetC, 0x22, 0x40)?;
+    if (s >> 7) & 1 == 1 {
+        println!("TARGET-C: 5 V VBUS present + source presented — the device should now be charging.");
+    } else {
+        println!(
+            "TARGET-C STATUS0={s:#04x}: VBUS not detected — check the device/cable on TARGET-C."
+        );
+    }
+    eprintln!("(Leave it running to keep charging; power-cycle or `usbmagic apollo --reconfigure` to stop.)");
     Ok(())
 }
 

@@ -757,6 +757,14 @@ impl Apollo {
         })
     }
 
+    /// Set the pd_bridge VBUS load-switch register (see the [`vbus`] constants).
+    /// Routes VBUS between ports via the shared TARGET-A rail.
+    pub fn set_vbus_switches(&self, bits: u8) -> Result<()> {
+        self.with_registers(|a, iw, dw| {
+            a.meta_txn(REG_VBUS, true, u32::from(bits), iw, dw).map(|_| ())
+        })
+    }
+
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {
@@ -838,6 +846,21 @@ const REG_TC_CMD: u8 = 2;
 const REG_TC_STATUS: u8 = 3;
 const REG_AUX_CMD: u8 = 5;
 const REG_AUX_STATUS: u8 = 6;
+const REG_VBUS: u8 = 7;
+
+/// VBUS load-switch bits for [`Apollo::set_vbus_switches`]. Each connects a port's
+/// VBUS to the shared TARGET-A rail.
+pub mod vbus {
+    /// Drive the TARGET-A rail out to TARGET-C.
+    pub const TARGET_C: u8 = 1 << 0;
+    /// Connect the host/CONTROL 5 V to the rail. Do NOT combine with a PD supply
+    /// raised above 5 V — it would feed that voltage into the host.
+    pub const CONTROL: u8 = 1 << 1;
+    /// Connect the AUX port's VBUS to the rail.
+    pub const AUX: u8 = 1 << 2;
+    /// Discharge the TARGET-A rail.
+    pub const TARGET_A_DISCHARGE: u8 = 1 << 3;
+}
 
 /// Which Cynthion Type-C port (FUSB302B) to drive via the pd_bridge gateware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

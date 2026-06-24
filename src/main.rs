@@ -29,6 +29,8 @@ enum Command {
     Info(DeviceSel),
     /// Capture USB traffic from a device.
     Capture(CaptureArgs),
+    /// Flash gateware to the Cynthion's FPGA (over Apollo).
+    Flash(FlashArgs),
 }
 
 #[derive(Args)]
@@ -88,12 +90,24 @@ impl From<SpeedArg> for Speed {
     }
 }
 
+#[derive(Args)]
+struct FlashArgs {
+    /// Bitstream file to flash. Defaults to the vendored firmware/*.bit.
+    #[arg(long)]
+    bit: Option<String>,
+
+    /// Program persistent SPI flash instead of volatile FPGA SRAM.
+    #[arg(long)]
+    persistent: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::List => cmd_list(),
         Command::Info(sel) => cmd_info(sel.device.as_deref()),
         Command::Capture(args) => cmd_capture(args),
+        Command::Flash(args) => cmd_flash(args),
     }
 }
 
@@ -349,4 +363,58 @@ fn print_packet_summary(index: u64, ts_ns: u64, bytes: &[u8]) {
         "#{index:<6} [{ts_ns:>12} ns] {:>4} B  {hex}{ellipsis}",
         bytes.len()
     );
+}
+
+fn cmd_flash(args: FlashArgs) -> Result<()> {
+    use usbmagic::flash::{self, FlashTarget};
+
+    match flash::find()? {
+        Some(d) => eprintln!(
+            "Found Cynthion in {:?} mode (bus {} addr {}{}).",
+            d.mode,
+            d.bus_id,
+            d.address,
+            d.serial
+                .as_deref()
+                .map(|s| format!(", serial {s}"))
+                .unwrap_or_default(),
+        ),
+        None => bail!("no Cynthion found"),
+    }
+
+    // Resolve the bitstream: explicit --bit, else the vendored firmware/*.bit.
+    let path = match args.bit {
+        Some(p) => p,
+        None => default_firmware().context(
+            "no --bit given and no vendored bitstream in firmware/ (run scripts/pull-gateware.sh)",
+        )?,
+    };
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+
+    let target = if args.persistent {
+        FlashTarget::Flash
+    } else {
+        FlashTarget::Sram
+    };
+    eprintln!(
+        "Flashing {} ({} bytes) to {}...",
+        path,
+        bytes.len(),
+        if args.persistent { "SPI flash" } else { "FPGA SRAM" }
+    );
+    flash::flash(&bytes, target)?;
+    eprintln!("Done.");
+    Ok(())
+}
+
+/// Find a vendored bitstream in `firmware/` (first `*.bit` alphabetically).
+fn default_firmware() -> Option<String> {
+    let mut bits: Vec<std::path::PathBuf> = std::fs::read_dir("firmware")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "bit"))
+        .collect();
+    bits.sort();
+    bits.first().map(|p| p.to_string_lossy().into_owned())
 }

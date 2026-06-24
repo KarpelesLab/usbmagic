@@ -254,9 +254,21 @@ cocotb for gateware, Rust unit + hardware-in-the-loop.
 
 - **`usbmagic`** (this repo, Rust) — host-side forensics core, backends, protocol
   clients, CLI/TUI.
-- **`usbmagic-gateware`** (new, Amaranth/Python) — host controller core, I2C masters,
-  command interface, optional SoC. Depends on LUNA. Sibling repo or submodule.
+- **[`KarpelesLab/usbmagic-gateware`](https://github.com/KarpelesLab/usbmagic-gateware)**
+  (Amaranth/Python) — host controller core, I2C masters, command interface, optional SoC.
+  Depends on LUNA/Cynthion. Builds reproducibly in **Docker** (oss-cad-suite + Amaranth)
+  via **GitHub Actions**, which uploads the `.bit` as an artifact and attaches it to
+  releases. Currently a Phase-0 bring-up **blinky**.
 - **`docs/`** — this document, protocol specs, hardware notes.
+
+### Build & distribution pipeline (implemented)
+
+1. `usbmagic-gateware` CI builds the `.bit` in the pinned Docker toolchain image.
+2. The released `.bit` is vendored into this repo under **`firmware/`** via **Git LFS**
+   (`scripts/pull-gateware.sh` fetches it; `firmware/VERSION` records provenance).
+3. `usbmagic` flashes it to the board itself — the Rust **`flash`** module + `usbmagic
+   flash` subcommand talk the **Apollo** USB protocol (`1d50:615c`), no Python tooling.
+   (Board-mode detection works today; the JTAG/configuration playback is the next step.)
 
 ## 10. Major risks & unknowns
 

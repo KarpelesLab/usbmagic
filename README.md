@@ -104,6 +104,22 @@ println!("{:04x}:{:04x}", dev.device_descriptor.vendor_id, dev.device_descriptor
 The CONTROL-port wire protocol that real gateware will speak is drafted in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+### Flashing gateware
+
+The FPGA gateware is built in a separate repo,
+[`KarpelesLab/usbmagic-gateware`](https://github.com/KarpelesLab/usbmagic-gateware)
+(Amaranth + Docker + CI). Its released `.bit` is vendored here under `firmware/` via
+Git LFS (`scripts/pull-gateware.sh`), and `usbmagic` flashes it to the board itself over
+the Apollo interface — no Python tooling:
+
+```sh
+usbmagic flash                 # flash the vendored bitstream to FPGA SRAM
+usbmagic flash --bit x.bit --persistent   # program SPI flash from a specific file
+```
+
+Board-mode detection (Apollo `1d50:615c` vs running gateware `1d50:615b`) works today;
+the bitstream-programming protocol port is in progress.
+
 ### Adding a backend
 
 Devices are abstracted by the `MagicDevice` trait and registered as a `Backend`

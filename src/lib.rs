@@ -31,6 +31,7 @@ pub mod backend;
 pub mod capture;
 pub mod device;
 pub mod error;
+pub mod flash;
 pub mod host;
 pub mod mock;
 pub mod pcap;

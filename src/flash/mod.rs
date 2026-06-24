@@ -601,7 +601,7 @@ impl Apollo {
     /// Read a register from an I2C device behind the pd_bridge gateware
     /// (bit-banged over the GPIO registers, whole transaction in one JTAG session).
     pub fn fusb302_read_register(&self, line: PdLine, dev_addr: u8, reg: u8) -> Result<u8> {
-        let regs = line.gpio_regs();
+        let regs = line.i2c_regs();
         self.with_registers(|a, iw, dw| {
             let mut bus = I2cBus::new(a, iw, dw, regs);
             bus.read_reg(dev_addr, reg)
@@ -610,7 +610,7 @@ impl Apollo {
 
     /// Write a register to an I2C device behind the pd_bridge gateware.
     pub fn fusb302_write_register(&self, line: PdLine, dev_addr: u8, reg: u8, value: u8) -> Result<()> {
-        let regs = line.gpio_regs();
+        let regs = line.i2c_regs();
         self.with_registers(|a, iw, dw| {
             let mut bus = I2cBus::new(a, iw, dw, regs);
             bus.write_reg(dev_addr, reg, value)
@@ -714,7 +714,7 @@ impl Apollo {
     /// the FUSB302B computing the CRC and BMC-encoding it.
     pub fn fusb302_tx(&self, line: PdLine, raw: &[u8]) -> Result<()> {
         use fusb302::*;
-        let regs = line.gpio_regs();
+        let regs = line.i2c_regs();
         // FIFO token stream: SOP ordered set, PACKSYM|len, payload, JAM_CRC, EOP,
         // TXOFF, TXON.
         let mut seq = vec![TX_SOP1, TX_SOP1, TX_SOP1, TX_SOP2, TX_PACKSYM | (raw.len() as u8)];
@@ -734,7 +734,7 @@ impl Apollo {
     /// or `None` if the FIFO is empty / the next token isn't a packet.
     pub fn fusb302_poll_message(&self, line: PdLine) -> Result<Option<Vec<u8>>> {
         use fusb302::*;
-        let regs = line.gpio_regs();
+        let regs = line.i2c_regs();
         self.with_registers(|a, iw, dw| {
             let mut bus = I2cBus::new(a, iw, dw, regs);
             // RX_EMPTY (STATUS1 bit5) set => nothing to read.
@@ -832,11 +832,12 @@ mod fusb302 {
     pub const TX_ON: u8 = 0xA1;
 }
 
-// pd_bridge gateware register map.
-const REG_GPIO_OUT: u8 = 2; // TARGET-C: bit0 = SCL level, bit1 = SDA drive-low
-const REG_GPIO_IN: u8 = 3; // TARGET-C: bit0 = SDA line, bit1 = FUSB302B INT#
-const REG_AUX_GPIO_OUT: u8 = 5; // AUX: same layout
-const REG_AUX_GPIO_IN: u8 = 6;
+// pd_bridge gateware register map: per port, an I2C-master command register
+// (write-triggered) and a status register.
+const REG_TC_CMD: u8 = 2;
+const REG_TC_STATUS: u8 = 3;
+const REG_AUX_CMD: u8 = 5;
+const REG_AUX_STATUS: u8 = 6;
 
 /// Which Cynthion Type-C port (FUSB302B) to drive via the pd_bridge gateware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,120 +847,77 @@ pub enum PdLine {
 }
 
 impl PdLine {
-    /// (GPIO-out register, GPIO-in register) for this port.
-    fn gpio_regs(self) -> (u8, u8) {
+    /// (command register, status register) for this port's I2C master.
+    fn i2c_regs(self) -> (u8, u8) {
         match self {
-            PdLine::TargetC => (REG_GPIO_OUT, REG_GPIO_IN),
-            PdLine::Aux => (REG_AUX_GPIO_OUT, REG_AUX_GPIO_IN),
+            PdLine::TargetC => (REG_TC_CMD, REG_TC_STATUS),
+            PdLine::Aux => (REG_AUX_CMD, REG_AUX_STATUS),
         }
     }
 }
 
-/// Bit-banged I2C master over the pd_bridge GPIO registers. Lives inside a single
-/// [`Apollo::with_registers`] session so every SCL/SDA edge reuses one JTAG
-/// connection. USB latency between edges is the (very slow, but valid) I2C clock.
+/// Driver for the in-gateware I2C master (LUNA I2CInitiator) behind the pd_bridge
+/// command/status registers. Lives inside one [`Apollo::with_registers`] session;
+/// each byte op is a single register write + status read (the I2C transfer itself
+/// completes in microseconds, far faster than the JTAG round-trip).
 struct I2cBus<'a> {
     a: &'a Apollo,
     iw: usize,
     dw: usize,
-    out: u32,
-    reg_out: u8,
-    reg_in: u8,
+    reg_cmd: u8,
+    reg_status: u8,
 }
 
 impl<'a> I2cBus<'a> {
-    const SCL: u32 = 0b01;
-    const SDA_LOW: u32 = 0b10;
+    // Command-register bits (must match the gateware).
+    const CMD_START: u32 = 1 << 0;
+    const CMD_STOP: u32 = 1 << 1;
+    const CMD_WRITE: u32 = 1 << 2;
+    const CMD_READ: u32 = 1 << 3;
+    const CMD_ACK: u32 = 1 << 4; // for READ: send ACK (continue) vs NACK (last)
 
     fn new(a: &'a Apollo, iw: usize, dw: usize, regs: (u8, u8)) -> Self {
-        // Idle: SCL high, SDA released.
         I2cBus {
             a,
             iw,
             dw,
-            out: Self::SCL,
-            reg_out: regs.0,
-            reg_in: regs.1,
+            reg_cmd: regs.0,
+            reg_status: regs.1,
         }
     }
 
-    fn apply(&self) -> Result<()> {
-        self.a
-            .meta_txn(self.reg_out, true, self.out, self.iw, self.dw)
-            .map(|_| ())
-    }
-
-    fn scl(&mut self, high: bool) -> Result<()> {
-        if high {
-            self.out |= Self::SCL;
-        } else {
-            self.out &= !Self::SCL;
+    /// Issue a command and wait for the I2C master to return to idle; returns the
+    /// final status word (bit0 busy, bit1 ack_o, bits[15:8] data_o).
+    fn issue(&self, cmd: u32) -> Result<u32> {
+        self.a.meta_txn(self.reg_cmd, true, cmd, self.iw, self.dw)?;
+        for _ in 0..64 {
+            let s = self.a.meta_txn(self.reg_status, false, 0, self.iw, self.dw)?;
+            if s & 1 == 0 {
+                return Ok(s); // not busy
+            }
         }
-        self.apply()
-    }
-
-    /// `release` true = let SDA float high (external pull-up); false = drive it low.
-    fn sda(&mut self, release: bool) -> Result<()> {
-        if release {
-            self.out &= !Self::SDA_LOW;
-        } else {
-            self.out |= Self::SDA_LOW;
-        }
-        self.apply()
-    }
-
-    fn read_sda(&self) -> Result<bool> {
-        Ok(self.a.meta_txn(self.reg_in, false, 0, self.iw, self.dw)? & 1 == 1)
+        Err(Error::Protocol("I2C master stayed busy".into()))
     }
 
     fn start(&mut self) -> Result<()> {
-        self.sda(true)?;
-        self.scl(true)?;
-        self.sda(false)?; // SDA falls while SCL high
-        self.scl(false)?;
-        Ok(())
+        self.issue(Self::CMD_START).map(|_| ())
     }
 
     fn stop(&mut self) -> Result<()> {
-        self.sda(false)?;
-        self.scl(true)?;
-        self.sda(true)?; // SDA rises while SCL high
-        Ok(())
+        self.issue(Self::CMD_STOP).map(|_| ())
     }
 
-    /// Clock out one bit (SDA = `bit`, where releasing high represents a 1).
-    fn write_bit(&mut self, bit: bool) -> Result<()> {
-        self.sda(bit)?;
-        self.scl(true)?;
-        self.scl(false)?;
-        Ok(())
-    }
-
-    fn read_bit(&mut self) -> Result<bool> {
-        self.sda(true)?; // release so the slave can drive
-        self.scl(true)?;
-        let bit = self.read_sda()?;
-        self.scl(false)?;
-        Ok(bit)
-    }
-
-    /// Write a byte MSB-first; returns true if the slave ACKed.
+    /// Write a byte; returns true if the slave ACKed. The gateware's `ack_o`
+    /// is `~sda` sampled during the ACK bit, so 1 = ACK (SDA pulled low).
     fn write_byte(&mut self, byte: u8) -> Result<bool> {
-        for i in (0..8).rev() {
-            self.write_bit((byte >> i) & 1 == 1)?;
-        }
-        let nack = self.read_bit()?; // ACK = slave pulls SDA low
-        Ok(!nack)
+        let s = self.issue(Self::CMD_WRITE | (u32::from(byte) << 8))?;
+        Ok((s >> 1) & 1 == 1)
     }
 
-    /// Read a byte MSB-first, then ACK (continue) or NACK (last byte).
+    /// Read a byte, then ACK (continue) or NACK (last byte).
     fn read_byte(&mut self, ack: bool) -> Result<u8> {
-        let mut v = 0u8;
-        for _ in 0..8 {
-            v = (v << 1) | u8::from(self.read_bit()?);
-        }
-        self.write_bit(!ack)?; // ACK = drive low (bit 0); NACK = release (bit 1)
-        Ok(v)
+        let s = self.issue(Self::CMD_READ | if ack { Self::CMD_ACK } else { 0 })?;
+        Ok(((s >> 8) & 0xFF) as u8)
     }
 
     fn read_reg(&mut self, dev_addr: u8, reg: u8) -> Result<u8> {

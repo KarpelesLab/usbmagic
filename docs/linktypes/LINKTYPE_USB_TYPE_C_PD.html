@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+
+    <!-- HEAD -->
+    <head>
+        <meta charset="utf-8">
+        <title>LINKTYPE_USB_TYPE_C_PD | TCPDUMP &amp; LIBPCAP</title>
+        <meta name="description" content="Pseudo-header for USB Type-C Power Delivery packets">
+    </head>
+    <!-- END OF HTML HEAD -->
+
+    <!-- BODY -->
+    <body>
+
+        <!-- PAGE CONTENTS -->
+        <div id="page">
+
+          <!-- Start of LINKTYPE_USB_TYPE_C_PD section -->
+          <div class="post">
+            <h2 class="title">
+                LINKTYPE_USB_TYPE_C_PD
+            </h2>
+            <div class="entry">
+                <p>
+                This is a <strong>proposal</strong> (the next currently-unallocated
+                link-layer header type number when written was <strong>304</strong>),
+                following the guidance in
+                <a href="https://github.com/the-tcpdump-group/libpcap/issues/1036">libpcap
+                issue #1036</a>. It is implemented by the
+                <a href="https://github.com/KarpelesLab/usbmagic">usbmagic</a> USB
+                forensics tool, which captures USB&nbsp;Power&nbsp;Delivery on the
+                Configuration Channel (CC) of a USB Type-C connection.
+                </p>
+
+                <h3 class="subtitle">Packet structure</h3>
+<pre>
++---------------------------+
+|          version          |   = 1
+|         (1 Octet)         |
++---------------------------+
+|         sop_type          |   SOP* ordered set
+|         (1 Octet)         |
++---------------------------+
+|         direction         |   0 = from DUT, 1 = to DUT
+|         (1 Octet)         |
++---------------------------+
+|           flags           |
+|         (1 Octet)         |
++---------------------------+
+|           crc32           |   little-endian
+|         (4 Octets)        |
++---------------------------+
+|          Payload          |   Power Delivery message (§6.2)
+.                           .
+.                           .
+</pre>
+
+                <h3 class="subtitle">Description</h3>
+<p>
+The pseudo-header is 8 octets. Multi-octet fields are in little-endian
+byte order.
+</p>
+<p>
+The <code>version</code> field is the pseudo-header version; it is 1 for
+this revision.
+</p>
+<p>
+The <code>sop_type</code> field identifies the Start-of-Packet ordered set
+(or ordered-set-like framing) the message was carried in:
+0 = SOP, 1 = SOP', 2 = SOP'', 3 = SOP'_Debug, 4 = SOP''_Debug,
+5 = Hard Reset, 6 = Cable Reset, 0xFF = unknown/not recorded.
+</p>
+<p>
+The <code>direction</code> field is 0 if the message was sent by the
+Device Under Test toward the capturing instrument (received), and 1 if it
+was sent by the instrument toward the Device Under Test (transmitted).
+</p>
+<p>
+The <code>flags</code> field is a bit field:
+bit&nbsp;0 (<code>CRC_PRESENT</code>) is set if the <code>crc32</code> field
+holds the actual on-wire CRC-32; bit&nbsp;1 (<code>CRC_VALID</code>) is set,
+only when <code>CRC_PRESENT</code> is set, if that CRC was verified as
+correct; bit&nbsp;2 (<code>CC_POLARITY</code>) is clear for CC1 and set for
+CC2; all other bits are reserved and set to zero. Controllers that compute
+and check the CRC in hardware (for example the FUSB302B, which performs
+"AUTO_CRC") do not expose the received CRC octets, so captures from such
+controllers clear <code>CRC_PRESENT</code> and set <code>crc32</code> to 0.
+</p>
+<p>
+The <code>crc32</code> field is the on-wire CRC-32, in little-endian byte
+order, when <code>CRC_PRESENT</code> is set; otherwise it is 0.
+</p>
+<p>
+The payload is a Power Delivery packet as specified by section 6.2
+"Messages" of the
+<a href="https://www.usb.org/document-library/usb-power-delivery">Universal
+Serial Bus Power Delivery Specification, revision 3.1, version 1.1</a>:
+the 16-bit Message Header, followed by any Extended Message Header and Data
+Objects. The 4b5b line coding, preamble, SOP ordered set, and trailing
+CRC/EOP of the physical layer are not included in the payload (the SOP and
+CRC are represented in the pseudo-header instead).
+</p>
+            </div>
+          </div>
+          <!-- End of LINKTYPE_USB_TYPE_C_PD section -->
+        </div>
+        <!-- END OF PAGE CONTENTS -->
+
+    </body>
+    <!-- END OF BODY -->
+</html>

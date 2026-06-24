@@ -8,7 +8,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use usbmagic::pcap::PcapWriter;
-use usbmagic::{discover, CaptureData, CaptureOptions, MagicDevice, Speed};
+use usbmagic::pcapng::{IfaceDesc, PcapNgWriter};
+use usbmagic::{
+    discover, CaptureData, CaptureOptions, MagicDevice, PdDirection, PdMessage, PdSop, PdTrace,
+    Speed, Vdm,
+};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +45,9 @@ enum Command {
     /// Act as a PD source: advertise Source_Capabilities to a consumer on
     /// TARGET-C and decode its replies.
     PdSource(PdListenArgs),
+    /// Send custom PD message(s) — raw bytes and/or a structured VDM — to a
+    /// device, tracing the full bidirectional exchange.
+    PdSend(PdSendArgs),
     /// Charge a device on TARGET-C at 5 V, sourced from a supply on AUX.
     Charge,
 }
@@ -122,6 +129,110 @@ struct PdListenArgs {
     /// Which Cynthion Type-C port's FUSB302B to use.
     #[arg(long, value_enum, default_value_t = PortArg::TargetC)]
     port: PortArg,
+
+    /// Also write the full PD trace to this pcapng file (LINKTYPE_USB_TYPE_C_PD).
+    #[arg(long)]
+    dump: Option<String>,
+}
+
+/// Arguments for `pd-send`.
+#[derive(Args)]
+struct PdSendArgs {
+    /// Which Cynthion Type-C port's FUSB302B to use.
+    #[arg(long, value_enum, default_value_t = PortArg::TargetC)]
+    port: PortArg,
+
+    /// PD PHY role to present before sending.
+    #[arg(long, value_enum, default_value_t = RoleArg::Source)]
+    role: RoleArg,
+
+    /// How to bring up VBUS on TARGET-C (sources need VBUS to be believed).
+    #[arg(long, value_enum, default_value_t = VbusArg::Auto)]
+    vbus: VbusArg,
+
+    /// Run an explicit source PD contract (Source_Caps → Accept → PS_RDY) first.
+    #[arg(long)]
+    negotiate: bool,
+
+    /// A full raw PD message as hex (16-bit header first, little-endian, then data
+    /// objects). Repeatable; sent in order. e.g. --raw 6111... .
+    #[arg(long = "raw", value_name = "HEX")]
+    raws: Vec<String>,
+
+    /// Build and send a structured Vendor-Defined Message.
+    #[arg(long)]
+    vdm: bool,
+    /// VDM Standard-or-Vendor ID (e.g. 0x05ac for Apple).
+    #[arg(long, value_parser = parse_u16, requires = "vdm")]
+    svid: Option<u16>,
+    /// VDM command (bits 0–4 of the VDM header).
+    #[arg(long, value_parser = parse_u8, requires = "vdm")]
+    command: Option<u8>,
+    /// VDM command type.
+    #[arg(long = "vdm-type", value_enum, default_value_t = VdmTypeArg::Req)]
+    vdm_type: VdmTypeArg,
+    /// VDM object position (0 if unused).
+    #[arg(long = "obj-pos", value_parser = parse_u8, default_value_t = 0)]
+    obj_pos: u8,
+    /// Additional Vendor Data Object(s) after the VDM header. Repeatable.
+    #[arg(long = "vdo", value_parser = parse_u32)]
+    vdos: Vec<u32>,
+    /// Override the 16-bit PD message header for the VDM (forensic: any value).
+    #[arg(long, value_parser = parse_u16, requires = "vdm")]
+    header: Option<u16>,
+
+    /// Seconds to keep tracing replies after the last send.
+    #[arg(short = 't', long, default_value_t = 2.0)]
+    listen: f64,
+
+    /// Write the full PD trace to this pcapng file (LINKTYPE_USB_TYPE_C_PD).
+    #[arg(long)]
+    dump: Option<String>,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum RoleArg {
+    /// Present Rp (we are the power source / DFP).
+    Source,
+    /// Present Rd (we are the sink / UFP).
+    Sink,
+    /// Leave the PHY as-is; just transmit.
+    Raw,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum VbusArg {
+    /// AUX supply if present, else CONTROL/host 5 V.
+    Auto,
+    /// Only route the AUX supply.
+    Aux,
+    /// Only route CONTROL/host 5 V.
+    Control,
+    /// Don't touch VBUS.
+    None,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum VdmTypeArg {
+    Req,
+    Ack,
+    Nak,
+    Busy,
+}
+
+/// Strip an optional `0x`/`0X` prefix and surrounding whitespace.
+fn hex_digits(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+}
+fn parse_u8(s: &str) -> std::result::Result<u8, std::num::ParseIntError> {
+    u8::from_str_radix(hex_digits(s), 16)
+}
+fn parse_u16(s: &str) -> std::result::Result<u16, std::num::ParseIntError> {
+    u16::from_str_radix(hex_digits(s), 16)
+}
+fn parse_u32(s: &str) -> std::result::Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(hex_digits(s), 16)
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -165,6 +276,7 @@ fn main() -> Result<()> {
         Command::PdProbe => cmd_pd_probe(),
         Command::PdListen(args) => cmd_pd_listen(args),
         Command::PdSource(args) => cmd_pd_source(args),
+        Command::PdSend(args) => cmd_pd_send(args),
         Command::Charge => cmd_charge(),
     }
 }
@@ -554,9 +666,8 @@ fn probe_fusb302_id(apollo: &usbmagic::flash::Apollo) {
 }
 
 fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use usbmagic::flash::Apollo;
-    use usbmagic::PdMessage;
 
     let path = "firmware/usbmagic-pd-bridge.bit";
     let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
@@ -590,8 +701,7 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
         (s0 >> 6) & 1,
     );
 
-    let start = Instant::now();
-    let mut count = 0u32;
+    let mut trace = make_trace(args.dump.as_deref())?;
     let mut irq_seen = 0u8;
     let mut got_caps = false;
     // Bit-banged I2C is slow, so drive this by passes (and stop on success)
@@ -604,18 +714,19 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
         // Drain the whole RX FIFO this pass (GoodCRC + Source_Capabilities arrive
         // back-to-back).
         while let Some(raw) = apollo.fusb302_poll_message(line)? {
-            count += 1;
             let msg = PdMessage { raw };
-            if pd_message_name(&msg) == "Source_Capabilities" {
+            if usbmagic::pd_message_name(&msg) == "Source_Capabilities" {
                 got_caps = true;
             }
-            print_pd_message(count, start.elapsed().as_secs_f64(), &msg);
+            trace.record(iface_id(line), PdDirection::FromDut, PdSop::Sop, cc, None, &msg)?;
         }
         if got_caps {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    trace.flush()?;
+    let count = trace.count();
     // INTERRUPT bits: I_CRC_CHK (0x10) = good PD message received; I_ACTIVITY
     // (0x40) = BMC activity seen; I_BC_LVL (0x01) = CC level changed.
     eprintln!(
@@ -640,7 +751,6 @@ fn cmd_pd_listen(args: PdListenArgs) -> Result<()> {
 fn cmd_pd_source(args: PdListenArgs) -> Result<()> {
     use std::time::{Duration, Instant};
     use usbmagic::flash::Apollo;
-    use usbmagic::PdMessage;
 
     let path = "firmware/usbmagic-pd-bridge.bit";
     let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
@@ -665,23 +775,18 @@ fn cmd_pd_source(args: PdListenArgs) -> Result<()> {
     if (s0 >> 7) & 1 == 0 {
         eprintln!(
             "  warning: VBUS not detected — a sink won't negotiate without VBUS. \
-             (Current pd_bridge gateware can't switch VBUS; that's the next gateware addition.)"
+             Bring it up first (e.g. `usbmagic charge`) or use `pd-send` which can route it."
         );
     }
 
-    // Source_Capabilities: header (data msg type 1, source, DFP, Rev2.0, 1 PDO) +
-    // one Fixed PDO: 5 V @ 1.5 A.
+    let mut trace = make_trace(args.dump.as_deref())?;
+    // Source_Capabilities advertising one Fixed PDO: 5 V @ 1.5 A.
     const PDO_5V_1A5: u32 = (100 << 10) | 150; // 50 mV & 10 mA units
     let start = Instant::now();
     let mut msg_id = 0u16;
-    let mut got = 0u32;
     while start.elapsed().as_secs_f64() < args.duration {
-        let header: u16 = 0x1161 | ((msg_id & 0x7) << 9);
-        let mut raw = header.to_le_bytes().to_vec();
-        raw.extend_from_slice(&PDO_5V_1A5.to_le_bytes());
-        if let Err(e) = apollo.fusb302_tx(line, &raw) {
-            eprintln!("TX error: {e}");
-        }
+        let msg = PdMessage::from_objects(source_header(1, 1, msg_id), &[PDO_5V_1A5]);
+        send_traced(&apollo, line, cc, &mut trace, &msg)?;
         msg_id = msg_id.wrapping_add(1);
 
         // Listen for replies (GoodCRC, Request, …) for a short window.
@@ -689,22 +794,13 @@ fn cmd_pd_source(args: PdListenArgs) -> Result<()> {
         while window.elapsed() < Duration::from_millis(300)
             && start.elapsed().as_secs_f64() < args.duration
         {
-            match apollo.fusb302_poll_message(line)? {
-                Some(r) => {
-                    got += 1;
-                    print_pd_message(got, start.elapsed().as_secs_f64(), &PdMessage { raw: r });
-                }
-                None => std::thread::sleep(Duration::from_millis(10)),
+            if drain_traced(&apollo, line, cc, &mut trace)? == 0 {
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
-    eprintln!("Done — {got} PD message(s) received from the consumer.");
-    if got == 0 {
-        eprintln!(
-            "No reply. If VBUS is present and the device is a PD sink on TARGET-C, this may be a \
-             CC-orientation or receiver detail — tell me and I'll iterate."
-        );
-    }
+    trace.flush()?;
+    eprintln!("Done — {} PD message(s) traced.", trace.count());
     Ok(())
 }
 
@@ -778,71 +874,297 @@ fn cmd_charge() -> Result<()> {
     Ok(())
 }
 
-fn pd_message_name(msg: &usbmagic::PdMessage) -> &'static str {
-    use usbmagic::pd::PdMessageClass;
-    let mt = msg.message_type().unwrap_or(0);
-    match msg.class() {
-        Some(PdMessageClass::Control) => match mt {
-            1 => "GoodCRC",
-            2 => "GotoMin",
-            3 => "Accept",
-            4 => "Reject",
-            5 => "Ping",
-            6 => "PS_RDY",
-            7 => "Get_Source_Cap",
-            8 => "Get_Sink_Cap",
-            9 => "DR_Swap",
-            10 => "PR_Swap",
-            11 => "VCONN_Swap",
-            12 => "Wait",
-            13 => "Soft_Reset",
-            _ => "Control(?)",
-        },
-        Some(PdMessageClass::Data) => match mt {
-            1 => "Source_Capabilities",
-            2 => "Request",
-            3 => "BIST",
-            4 => "Sink_Capabilities",
-            5 => "Battery_Status",
-            6 => "Alert",
-            15 => "Vendor_Defined",
-            _ => "Data(?)",
-        },
-        Some(PdMessageClass::Extended) => "Extended",
-        None => "(empty)",
+// ---- PD send + trace helpers (shared by pd-listen / pd-source / pd-send) ----
+
+/// pcapng interface id for a port (interface 0 = TARGET-C, 1 = AUX).
+fn iface_id(line: usbmagic::flash::PdLine) -> u32 {
+    match line {
+        usbmagic::flash::PdLine::TargetC => 0,
+        usbmagic::flash::PdLine::Aux => 1,
     }
 }
 
-fn print_pd_message(index: u32, ts: f64, msg: &usbmagic::PdMessage) {
-    use usbmagic::pd::Pdo;
-    let hex: String = msg.raw.iter().map(|b| format!("{b:02x}")).collect();
-    println!(
-        "#{index:<3} [{ts:7.3}s] {:<20} hdr={:#06x} obj={} raw={hex}",
-        pd_message_name(msg),
-        msg.header().unwrap_or(0),
-        msg.num_data_objects().unwrap_or(0),
-    );
-    if pd_message_name(msg) == "Source_Capabilities" {
-        for (i, o) in msg.objects().iter().enumerate() {
-            let pdo = Pdo { raw: *o };
-            if let (Some(mv), Some(ma)) = (pdo.fixed_voltage_mv(), pdo.fixed_max_current_ma()) {
-                println!(
-                    "       PDO{}: {:.2} V @ {:.2} A (fixed)",
-                    i + 1,
-                    mv as f64 / 1000.0,
-                    ma as f64 / 1000.0
-                );
-            } else if let Some((min_mv, max_mv, max_ma)) = pdo.pps() {
-                println!(
-                    "       PDO{}: {:.2}–{:.2} V @ {:.2} A (PPS)",
-                    i + 1,
-                    min_mv as f64 / 1000.0,
-                    max_mv as f64 / 1000.0,
-                    max_ma as f64 / 1000.0
-                );
+/// Build a PD trace, optionally backed by a pcapng file with both ports as IDBs.
+fn make_trace(dump: Option<&str>) -> Result<PdTrace> {
+    let writer = match dump {
+        Some(path) => {
+            let f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+            let w: Box<dyn Write> = Box::new(BufWriter::new(f));
+            let ifaces = [
+                IfaceDesc {
+                    name: "TARGET-C",
+                    linktype: usbmagic::LINKTYPE_USB_TYPE_C_PD,
+                    snaplen: 4096,
+                },
+                IfaceDesc {
+                    name: "AUX",
+                    linktype: usbmagic::LINKTYPE_USB_TYPE_C_PD,
+                    snaplen: 4096,
+                },
+            ];
+            Some(PcapNgWriter::new(w, &ifaces)?)
+        }
+        None => None,
+    };
+    Ok(PdTrace::new(writer))
+}
+
+/// 16-bit PD message header for a message we originate as a source/DFP, Spec
+/// Rev 2.0 (power-role=source, data-role=DFP). `msg_type` in bits 0–4, MessageID
+/// in 9–11, number of data objects in 12–14. Matches the working 0x1161 used for
+/// Source_Capabilities with one PDO.
+fn source_header(msg_type: u16, ndo: u16, msg_id: u16) -> u16 {
+    0x0160 | (msg_type & 0x1F) | ((msg_id & 0x7) << 9) | ((ndo & 0x7) << 12)
+}
+
+/// Transmit a PD message and record it (direction = to DUT).
+fn send_traced(
+    apollo: &usbmagic::flash::Apollo,
+    line: usbmagic::flash::PdLine,
+    cc: u8,
+    trace: &mut PdTrace,
+    msg: &PdMessage,
+) -> Result<()> {
+    apollo.fusb302_tx(line, &msg.raw)?;
+    trace.record(iface_id(line), PdDirection::ToDut, PdSop::Sop, cc, None, msg)?;
+    Ok(())
+}
+
+/// Drain every message currently in the RX FIFO, recording each (from DUT).
+/// Returns how many were read.
+fn drain_traced(
+    apollo: &usbmagic::flash::Apollo,
+    line: usbmagic::flash::PdLine,
+    cc: u8,
+    trace: &mut PdTrace,
+) -> Result<u32> {
+    let mut n = 0;
+    while let Some(raw) = apollo.fusb302_poll_message(line)? {
+        let msg = PdMessage { raw };
+        trace.record(iface_id(line), PdDirection::FromDut, PdSop::Sop, cc, None, &msg)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Run an explicit source PD contract: advertise `pdos`, wait for the sink's
+/// Request, then send Accept + PS_RDY. Returns true if a Request was answered.
+/// `msg_id` is advanced as messages are sent.
+fn source_contract(
+    apollo: &usbmagic::flash::Apollo,
+    line: usbmagic::flash::PdLine,
+    cc: u8,
+    trace: &mut PdTrace,
+    pdos: &[u32],
+    msg_id: &mut u16,
+) -> Result<bool> {
+    use std::time::{Duration, Instant};
+    for _ in 0..10 {
+        let caps = PdMessage::from_objects(source_header(1, pdos.len() as u16, *msg_id), pdos);
+        send_traced(apollo, line, cc, trace, &caps)?;
+        *msg_id = msg_id.wrapping_add(1);
+        let window = Instant::now();
+        while window.elapsed() < Duration::from_millis(400) {
+            if let Some(raw) = apollo.fusb302_poll_message(line)? {
+                let m = PdMessage { raw };
+                let name = usbmagic::pd_message_name(&m);
+                trace.record(iface_id(line), PdDirection::FromDut, PdSop::Sop, cc, None, &m)?;
+                if name == "Request" {
+                    let accept = PdMessage::from_objects(source_header(3, 0, *msg_id), &[]);
+                    send_traced(apollo, line, cc, trace, &accept)?;
+                    *msg_id = msg_id.wrapping_add(1);
+                    std::thread::sleep(Duration::from_millis(5));
+                    let rdy = PdMessage::from_objects(source_header(6, 0, *msg_id), &[]);
+                    send_traced(apollo, line, cc, trace, &rdy)?;
+                    *msg_id = msg_id.wrapping_add(1);
+                    return Ok(true);
+                }
             } else {
-                println!("       PDO{}: {o:#010x}", i + 1);
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
+    Ok(false)
+}
+
+/// Bring up 5 V VBUS on TARGET-C: prefer an AUX supply, fall back to CONTROL/host
+/// 5 V. Returns a human label for the source used. Only ever 5 V, and AUX/CONTROL
+/// are never on the rail together (no back-feed into the host).
+fn bring_up_vbus_target_c(apollo: &usbmagic::flash::Apollo, mode: VbusArg) -> Result<&'static str> {
+    use std::time::Duration;
+    use usbmagic::flash::{vbus, PdLine};
+    apollo.set_vbus_switches(0)?;
+    let try_aux = matches!(mode, VbusArg::Auto | VbusArg::Aux);
+    let try_control = matches!(mode, VbusArg::Auto | VbusArg::Control);
+    if try_aux {
+        let cc = apollo.fusb302_setup_sink(PdLine::Aux)?;
+        if cc != 0 {
+            for _ in 0..20 {
+                let s = apollo.fusb302_read_register(PdLine::Aux, 0x22, 0x40)?;
+                if (s >> 7) & 1 == 1 {
+                    apollo.set_vbus_switches(vbus::AUX_IN | vbus::AUX | vbus::TARGET_C)?;
+                    return Ok("AUX 5 V");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if matches!(mode, VbusArg::Aux) {
+            bail!("no powered supply detected on AUX");
+        }
+    }
+    if try_control {
+        apollo.set_vbus_switches(vbus::CONTROL_IN | vbus::CONTROL | vbus::TARGET_C)?;
+        std::thread::sleep(Duration::from_millis(150));
+        let s = apollo.fusb302_read_register(PdLine::TargetC, 0x22, 0x40).unwrap_or(0);
+        if (s >> 7) & 1 == 1 {
+            return Ok("CONTROL / host 5 V");
+        }
+        return Ok("CONTROL / host 5 V (VBUS not yet confirmed)");
+    }
+    bail!("no VBUS source available (mode {mode:?})");
+}
+
+/// Decode a hex string (whitespace and `_` allowed) into bytes.
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
+    if s.len() % 2 != 0 {
+        bail!("hex must have an even number of digits");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!("{e}")))
+        .collect()
+}
+
+fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
+    use std::time::{Duration, Instant};
+    use usbmagic::flash::{Apollo, PdLine};
+
+    // Validate / parse message args up front (fail fast before touching hardware).
+    let mut raw_msgs: Vec<Vec<u8>> = Vec::new();
+    for h in &args.raws {
+        let bytes = decode_hex(h).with_context(|| format!("bad --raw hex {h:?}"))?;
+        if bytes.len() < 2 {
+            bail!("--raw message {h:?} is too short (need at least the 2 header bytes)");
+        }
+        raw_msgs.push(bytes);
+    }
+    let vdm = if args.vdm {
+        let svid = args.svid.context("--vdm requires --svid")?;
+        let command = args.command.context("--vdm requires --command")?;
+        Some(Vdm {
+            svid,
+            command,
+            command_type: match args.vdm_type {
+                VdmTypeArg::Req => 0,
+                VdmTypeArg::Ack => 1,
+                VdmTypeArg::Nak => 2,
+                VdmTypeArg::Busy => 3,
+            },
+            object_position: args.obj_pos,
+            objects: args.vdos.clone(),
+        })
+    } else {
+        None
+    };
+    if raw_msgs.is_empty() && vdm.is_none() {
+        bail!("nothing to send — pass --raw <hex> and/or --vdm --svid .. --command ..");
+    }
+
+    let path = "firmware/usbmagic-pd-bridge.bit";
+    let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let apollo = Apollo::open().context("opening Apollo")?;
+    eprintln!("Flashing pd_bridge ({} bytes)...", bitstream.len());
+    apollo.configure_sram(&bitstream)?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    let line = PdLine::from(args.port);
+    let port = port_name(args.port);
+
+    // PHY role + VBUS.
+    let cc = match args.role {
+        RoleArg::Source => {
+            if !matches!(args.vbus, VbusArg::None) && line == PdLine::TargetC {
+                let src = bring_up_vbus_target_c(&apollo, args.vbus)?;
+                eprintln!("VBUS on TARGET-C via {src}.");
+            }
+            let cc = apollo.fusb302_setup_source(line)?;
+            if cc == 0 {
+                bail!("no PD sink detected on {port} — is the device plugged in?");
+            }
+            eprintln!("Presenting source (Rp) on {port} CC{cc}.");
+            cc
+        }
+        RoleArg::Sink => {
+            let cc = apollo.fusb302_setup_sink(line)?;
+            if cc == 0 {
+                bail!("no source detected on {port}");
+            }
+            eprintln!("Presenting sink (Rd) on {port} CC{cc}.");
+            cc
+        }
+        RoleArg::Raw => 0,
+    };
+
+    let mut trace = make_trace(args.dump.as_deref())?;
+    let mut msg_id = 0u16;
+
+    if args.negotiate {
+        if matches!(args.role, RoleArg::Source) {
+            const PDO_5V_1A5: u32 = (100 << 10) | 150;
+            if source_contract(&apollo, line, cc, &mut trace, &[PDO_5V_1A5], &mut msg_id)? {
+                eprintln!("Explicit PD contract established.");
+            } else {
+                eprintln!("No Request from sink; sending without an explicit contract.");
+            }
+        } else {
+            eprintln!("note: --negotiate only applies to --role source; skipping.");
+        }
+    }
+
+    // Brief drain between/after sends to capture GoodCRC + replies.
+    let drain_window = |apollo: &Apollo, trace: &mut PdTrace, ms: u64| -> Result<()> {
+        let w = Instant::now();
+        while w.elapsed() < Duration::from_millis(ms) {
+            if drain_traced(apollo, line, cc, trace)? == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    };
+
+    // Raw messages (header bytes verbatim, low byte first), then the VDM.
+    for bytes in &raw_msgs {
+        send_traced(&apollo, line, cc, &mut trace, &PdMessage { raw: bytes.clone() })?;
+        drain_window(&apollo, &mut trace, 150)?;
+    }
+    if let Some(v) = &vdm {
+        let mut objects = vec![v.vdm_header()];
+        objects.extend_from_slice(&v.objects);
+        let header = args
+            .header
+            .unwrap_or_else(|| source_header(15, objects.len() as u16, msg_id));
+        send_traced(
+            &apollo,
+            line,
+            cc,
+            &mut trace,
+            &PdMessage::from_objects(header, &objects),
+        )?;
+        drain_window(&apollo, &mut trace, 150)?;
+    }
+
+    // Keep tracing replies for the listen window.
+    let start = Instant::now();
+    while start.elapsed().as_secs_f64() < args.listen {
+        if drain_traced(&apollo, line, cc, &mut trace)? == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    trace.flush()?;
+    eprintln!("Done — {} PD message(s) traced.", trace.count());
+    if let Some(d) = &args.dump {
+        eprintln!("Wrote pcapng trace to {d} (LINKTYPE_USB_TYPE_C_PD).");
+    }
+    Ok(())
 }

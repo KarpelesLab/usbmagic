@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+pub mod trace;
+pub use trace::{format_pd_message, pd_message_name, PdTrace};
+
 /// Which Type-C port's PD controller to address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdPort {

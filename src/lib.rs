@@ -35,6 +35,7 @@ pub mod flash;
 pub mod host;
 pub mod mock;
 pub mod pcap;
+pub mod pcapng;
 pub mod pd;
 pub mod power;
 
@@ -44,5 +45,6 @@ pub use error::{Error, Result};
 pub use host::{
     DeviceDescriptor, Direction, EnumeratedDevice, Handshake, Pid, RawTransaction, Setup, UsbHost,
 };
-pub use pd::{PdMessage, PdPort, PowerDelivery, Vdm};
+pub use pcapng::{pd_pseudo_header, PcapNgWriter, PdDirection, PdSop, LINKTYPE_USB_TYPE_C_PD};
+pub use pd::{format_pd_message, pd_message_name, PdMessage, PdPort, PdTrace, PowerDelivery, Vdm};
 pub use power::{MonitoredPort, PortPower, PowerMonitor};

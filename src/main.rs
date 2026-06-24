@@ -490,5 +490,16 @@ fn cmd_pd_probe() -> Result<()> {
         gpio_in & 1,
         (gpio_in >> 1) & 1
     );
+
+    // Read the FUSB302B Device ID register (I2C 0x22, reg 0x01) over bit-banged I2C.
+    match apollo.fusb302_read_register(0x22, 0x01) {
+        Ok(id) => println!(
+            "FUSB302B DeviceID (reg 0x01) = {id:#04x}  (version {:#x}, rev {:#x}){}",
+            (id >> 4) & 0xf,
+            id & 0x3,
+            if id != 0x00 && id != 0xff { " ✓" } else { " (no device?)" }
+        ),
+        Err(e) => println!("FUSB302B read failed: {e}"),
+    }
     Ok(())
 }

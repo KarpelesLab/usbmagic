@@ -598,6 +598,23 @@ impl Apollo {
         self.with_registers(|_, iw, dw| Ok((iw, dw)))
     }
 
+    /// Read a register from an I2C device behind the pd_bridge gateware
+    /// (bit-banged over the GPIO registers, whole transaction in one JTAG session).
+    pub fn fusb302_read_register(&self, dev_addr: u8, reg: u8) -> Result<u8> {
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw);
+            bus.read_reg(dev_addr, reg)
+        })
+    }
+
+    /// Write a register to an I2C device behind the pd_bridge gateware.
+    pub fn fusb302_write_register(&self, dev_addr: u8, reg: u8, value: u8) -> Result<()> {
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw);
+            bus.write_reg(dev_addr, reg, value)
+        })
+    }
+
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {
@@ -615,6 +632,153 @@ impl Apollo {
             )
             .wait()?;
         Ok(())
+    }
+}
+
+// pd_bridge gateware register map.
+const REG_GPIO_OUT: u8 = 2; // bit0 = SCL level, bit1 = SDA drive-low
+const REG_GPIO_IN: u8 = 3; // bit0 = SDA line, bit1 = FUSB302B INT#
+
+/// Bit-banged I2C master over the pd_bridge GPIO registers. Lives inside a single
+/// [`Apollo::with_registers`] session so every SCL/SDA edge reuses one JTAG
+/// connection. USB latency between edges is the (very slow, but valid) I2C clock.
+struct I2cBus<'a> {
+    a: &'a Apollo,
+    iw: usize,
+    dw: usize,
+    out: u32,
+}
+
+impl<'a> I2cBus<'a> {
+    const SCL: u32 = 0b01;
+    const SDA_LOW: u32 = 0b10;
+
+    fn new(a: &'a Apollo, iw: usize, dw: usize) -> Self {
+        // Idle: SCL high, SDA released.
+        I2cBus {
+            a,
+            iw,
+            dw,
+            out: Self::SCL,
+        }
+    }
+
+    fn apply(&self) -> Result<()> {
+        self.a
+            .meta_txn(REG_GPIO_OUT, true, self.out, self.iw, self.dw)
+            .map(|_| ())
+    }
+
+    fn scl(&mut self, high: bool) -> Result<()> {
+        if high {
+            self.out |= Self::SCL;
+        } else {
+            self.out &= !Self::SCL;
+        }
+        self.apply()
+    }
+
+    /// `release` true = let SDA float high (external pull-up); false = drive it low.
+    fn sda(&mut self, release: bool) -> Result<()> {
+        if release {
+            self.out &= !Self::SDA_LOW;
+        } else {
+            self.out |= Self::SDA_LOW;
+        }
+        self.apply()
+    }
+
+    fn read_sda(&self) -> Result<bool> {
+        Ok(self.a.meta_txn(REG_GPIO_IN, false, 0, self.iw, self.dw)? & 1 == 1)
+    }
+
+    fn start(&mut self) -> Result<()> {
+        self.sda(true)?;
+        self.scl(true)?;
+        self.sda(false)?; // SDA falls while SCL high
+        self.scl(false)?;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.sda(false)?;
+        self.scl(true)?;
+        self.sda(true)?; // SDA rises while SCL high
+        Ok(())
+    }
+
+    /// Clock out one bit (SDA = `bit`, where releasing high represents a 1).
+    fn write_bit(&mut self, bit: bool) -> Result<()> {
+        self.sda(bit)?;
+        self.scl(true)?;
+        self.scl(false)?;
+        Ok(())
+    }
+
+    fn read_bit(&mut self) -> Result<bool> {
+        self.sda(true)?; // release so the slave can drive
+        self.scl(true)?;
+        let bit = self.read_sda()?;
+        self.scl(false)?;
+        Ok(bit)
+    }
+
+    /// Write a byte MSB-first; returns true if the slave ACKed.
+    fn write_byte(&mut self, byte: u8) -> Result<bool> {
+        for i in (0..8).rev() {
+            self.write_bit((byte >> i) & 1 == 1)?;
+        }
+        let nack = self.read_bit()?; // ACK = slave pulls SDA low
+        Ok(!nack)
+    }
+
+    /// Read a byte MSB-first, then ACK (continue) or NACK (last byte).
+    fn read_byte(&mut self, ack: bool) -> Result<u8> {
+        let mut v = 0u8;
+        for _ in 0..8 {
+            v = (v << 1) | u8::from(self.read_bit()?);
+        }
+        self.write_bit(!ack)?; // ACK = drive low (bit 0); NACK = release (bit 1)
+        Ok(v)
+    }
+
+    fn read_reg(&mut self, dev_addr: u8, reg: u8) -> Result<u8> {
+        self.start()?;
+        if !self.write_byte(dev_addr << 1)? {
+            // (address << 1) | 0 — R/W bit 0 = write
+            self.stop()?;
+            return Err(Error::Protocol(format!(
+                "I2C: no ACK from device {dev_addr:#04x} (write)"
+            )));
+        }
+        if !self.write_byte(reg)? {
+            self.stop()?;
+            return Err(Error::Protocol(format!("I2C: no ACK for register {reg:#04x}")));
+        }
+        self.start()?; // repeated start
+        if !self.write_byte((dev_addr << 1) | 1)? {
+            self.stop()?;
+            return Err(Error::Protocol(format!(
+                "I2C: no ACK from device {dev_addr:#04x} (read)"
+            )));
+        }
+        let value = self.read_byte(false)?; // single byte -> NACK
+        self.stop()?;
+        Ok(value)
+    }
+
+    fn write_reg(&mut self, dev_addr: u8, reg: u8, value: u8) -> Result<()> {
+        self.start()?;
+        let ok =
+            self.write_byte(dev_addr << 1)? && self.write_byte(reg)? && self.write_byte(value)?;
+        self.stop()?;
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Protocol(format!(
+                "I2C write to {dev_addr:#04x} reg {reg:#04x} was not ACKed"
+            )))
+        }
     }
 }
 

@@ -44,7 +44,30 @@ mod jtag {
 
     // TAP FSM state numbers (subset).
     pub const STATE_RESET: u16 = 0;
+    pub const STATE_IDLE: u16 = 1;
     pub const STATE_DRSHIFT: u16 = 4;
+    pub const STATE_DRPAUSE: u16 = 6;
+    pub const STATE_IRSHIFT: u16 = 11;
+    pub const STATE_IRPAUSE: u16 = 13;
+}
+
+/// ECP5 configuration opcodes and status flags (from Lattice TN1260 / GSG Apollo).
+#[allow(dead_code)]
+mod ecp5 {
+    pub const READ_ID: u8 = 0xE0;
+    pub const LSC_READ_STATUS: u8 = 0x3C;
+    pub const LSC_REFRESH: u8 = 0x79;
+    pub const ISC_ENABLE: u8 = 0xC6;
+    pub const ISC_ERASE: u8 = 0x0E;
+    pub const ISC_DISABLE: u8 = 0x26;
+    pub const LSC_INIT_ADDRESS: u8 = 0x46; // "set working address"
+    pub const LSC_BITSTREAM_BURST: u8 = 0x7A;
+    pub const NO_OP: u8 = 0xFF;
+    pub const MAGIC_1C: u8 = 0x1C; // pre-configuration command used by Apollo
+
+    pub const STATUS_DONE: u32 = 1 << 8;
+    pub const STATUS_BUSY: u32 = 1 << 12;
+    pub const STATUS_FAIL: u32 = 1 << 13;
 }
 
 /// USB vendor ID shared by Cynthion/Apollo.
@@ -148,24 +171,28 @@ impl Apollo {
     /// running gateware with an Apollo stub interface, it requests the handoff
     /// and waits for Apollo to re-enumerate.
     pub fn open() -> Result<Apollo> {
-        if let Some(info) = find_apollo_info()? {
-            return Apollo::from_info(&info);
+        // If no Apollo is present, ask running gateware to hand off the USB port.
+        if find_apollo_info()?.is_none() {
+            let stub = find_stub_info()?.ok_or(Error::NoDevice)?;
+            request_handoff(&stub)?;
         }
 
-        // No Apollo yet — look for running gateware with a stub interface.
-        let stub = find_stub_info()?.ok_or(Error::NoDevice)?;
-        request_handoff(&stub)?;
-
-        // Wait for Apollo to re-enumerate (up to ~5 s).
-        for _ in 0..50 {
-            std::thread::sleep(Duration::from_millis(100));
+        // Wait for Apollo, retrying the open: right after (re-)enumeration the
+        // device node can briefly be inaccessible until udev applies group
+        // permissions, which surfaces as a transient permission error.
+        let mut last_err = None;
+        for _ in 0..60 {
             if let Some(info) = find_apollo_info()? {
-                return Apollo::from_info(&info);
+                match Apollo::from_info(&info) {
+                    Ok(apollo) => return Ok(apollo),
+                    Err(e) => last_err = Some(e),
+                }
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        Err(Error::Protocol(
-            "requested Apollo handoff but Apollo did not re-enumerate".into(),
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            Error::Protocol("Apollo did not become available after handoff".into())
+        }))
     }
 
     fn from_info(info: &nusb::DeviceInfo) -> Result<Apollo> {
@@ -297,6 +324,176 @@ impl Apollo {
         Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
+    // --- JTAG primitives (over Apollo vendor requests) ---
+
+    fn jtag_go(&self, state: u16) -> Result<()> {
+        self.out_req(jtag::REQUEST_JTAG_GO_TO_STATE, state, 0, &[])
+    }
+
+    /// RUNTEST: idle for `cycles` TCK cycles.
+    fn jtag_run_test(&self, cycles: u16) -> Result<()> {
+        self.jtag_go(jtag::STATE_IDLE)?;
+        self.out_req(jtag::REQUEST_JTAG_RUN_CLOCK, cycles, 0, &[])
+    }
+
+    /// Max bytes per scan the firmware accepts (default 256 if it doesn't report).
+    fn jtag_max_bytes(&self) -> usize {
+        match self.in_req(jtag::REQUEST_JTAG_GET_INFO, 0, 0, 8) {
+            Ok(d) if d.len() >= 4 => match u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize {
+                0 => 256,
+                m => m,
+            },
+            _ => 256,
+        }
+    }
+
+    /// Shift an 8-bit instruction into IR, ending in IRPAUSE.
+    fn jtag_shift_ir(&self, opcode: u8) -> Result<()> {
+        self.jtag_go(jtag::STATE_IRSHIFT)?;
+        self.out_req(jtag::REQUEST_JTAG_SET_OUT_BUFFER, 0, 0, &[opcode])?;
+        self.out_req(jtag::REQUEST_JTAG_SCAN, 8, 1, &[])?; // advance on last bit
+        self.jtag_go(jtag::STATE_IRPAUSE)
+    }
+
+    /// Read `nbits` from DR (ending in DRPAUSE).
+    fn jtag_shift_dr_read(&self, nbits: u16) -> Result<Vec<u8>> {
+        self.jtag_go(jtag::STATE_DRSHIFT)?;
+        self.out_req(jtag::REQUEST_JTAG_CLEAR_OUT_BUFFER, 0, 0, &[])?;
+        self.out_req(jtag::REQUEST_JTAG_SCAN, nbits, 0, &[])?;
+        let buf = self.in_req(jtag::REQUEST_JTAG_GET_IN_BUFFER, 0, 0, nbits.div_ceil(8))?;
+        self.jtag_go(jtag::STATE_DRPAUSE)?;
+        Ok(buf)
+    }
+
+    /// Write `nbits` of `data` into DR (ending in DRPAUSE).
+    ///
+    /// Matches Apollo's wire format: the byte array is reversed, then each byte is
+    /// shifted LSB-first by the firmware. Chunked to the firmware's buffer size;
+    /// write responses are discarded.
+    fn jtag_shift_dr_write(&self, data: &[u8], nbits: u32, max_bytes: usize) -> Result<()> {
+        self.jtag_go(jtag::STATE_DRSHIFT)?;
+        let wire: Vec<u8> = data.iter().rev().copied().collect();
+        let mut sent_bits: u32 = 0;
+        let mut off = 0usize;
+        while off < wire.len() {
+            let end = (off + max_bytes).min(wire.len());
+            let chunk = &wire[off..end];
+            off = end;
+            let last = off >= wire.len();
+            let chunk_bits = ((chunk.len() as u32) * 8).min(nbits - sent_bits);
+            sent_bits += chunk_bits;
+            self.out_req(jtag::REQUEST_JTAG_SET_OUT_BUFFER, 0, 0, chunk)?;
+            self.out_req(
+                jtag::REQUEST_JTAG_SCAN,
+                chunk_bits as u16,
+                if last { 1 } else { 0 },
+                &[],
+            )?;
+        }
+        self.jtag_go(jtag::STATE_DRPAUSE)
+    }
+
+    /// Issue an ECP5 command with an optional DR data payload.
+    fn ecp5_cmd_write(&self, opcode: u8, data: &[u8], nbits: u32, max_bytes: usize) -> Result<()> {
+        self.jtag_shift_ir(opcode)?;
+        if nbits > 0 {
+            self.jtag_shift_dr_write(data, nbits, max_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Issue an ECP5 command and read a 32-bit DR response.
+    fn ecp5_cmd_read32(&self, opcode: u8) -> Result<u32> {
+        self.jtag_shift_ir(opcode)?;
+        let buf = self.jtag_shift_dr_read(32)?;
+        if buf.len() < 4 {
+            return Err(Error::Protocol("short ECP5 response".into()));
+        }
+        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+    }
+
+    fn ecp5_status(&self) -> Result<u32> {
+        self.ecp5_cmd_read32(ecp5::LSC_READ_STATUS)
+    }
+
+    fn ecp5_wait_not_busy(&self) -> Result<u32> {
+        for _ in 0..200 {
+            let status = self.ecp5_status()?;
+            if status & ecp5::STATUS_BUSY == 0 {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(Error::Protocol("ECP5 stayed busy".into()))
+    }
+
+    /// Configure the ECP5's SRAM with `bitstream` over JTAG (volatile; lost on
+    /// power cycle). Returns the final status register. Ported from GSG Apollo's
+    /// `ECP5_JTAGProgrammer.configure`.
+    pub fn configure_sram(&self, bitstream: &[u8]) -> Result<u32> {
+        // Apollo: reverse the bits in each byte, then reverse the byte order; the
+        // DR-write reverses the byte order again, netting original-order bytes
+        // shifted MSB-first.
+        let mut payload: Vec<u8> = bitstream.iter().map(|b| b.reverse_bits()).collect();
+        payload.reverse();
+
+        let max_bytes = self.jtag_max_bytes().max(8);
+
+        self.out_req(jtag::REQUEST_JTAG_START, 0, 0, &[])?;
+        self.jtag_go(jtag::STATE_RESET)?;
+
+        // Restart configuration (clear SRAM).
+        self.ecp5_cmd_write(ecp5::LSC_REFRESH, &[], 0, max_bytes)?;
+        self.ecp5_wait_not_busy().ok();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify a plausible part is present.
+        let id = self.ecp5_cmd_read32(ecp5::READ_ID)?;
+        if id == 0 || id == 0xFFFF_FFFF {
+            self.out_req(jtag::REQUEST_JTAG_STOP, 0, 0, &[])?;
+            return Err(Error::Protocol(format!("no FPGA detected (id {id:#010x})")));
+        }
+
+        // Apollo's pre-configuration command (0x1C with 510 bits of 0x3f,0xff…).
+        let mut magic = vec![0x3fu8];
+        magic.extend(std::iter::repeat(0xffu8).take(63));
+        self.ecp5_cmd_write(ecp5::MAGIC_1C, &magic, 510, max_bytes)?;
+
+        // Enable configuration.
+        self.ecp5_cmd_write(ecp5::ISC_ENABLE, &[0x00], 8, max_bytes)?;
+        self.jtag_run_test(2)?;
+
+        // Erase SRAM.
+        self.ecp5_cmd_write(ecp5::ISC_ERASE, &[0x01], 8, max_bytes)?;
+        self.ecp5_wait_not_busy().ok();
+        self.jtag_run_test(2)?;
+
+        // Set working address, then burst the bitstream.
+        self.ecp5_cmd_write(ecp5::LSC_INIT_ADDRESS, &[0x01], 8, max_bytes)?;
+        let nbits = (payload.len() as u32) * 8;
+        self.ecp5_cmd_write(ecp5::LSC_BITSTREAM_BURST, &payload, nbits, max_bytes)?;
+
+        // Allow configuration to take.
+        self.jtag_shift_ir(ecp5::NO_OP)?;
+        self.jtag_run_test(100)?;
+
+        let status_after_burst = self.ecp5_status()?;
+
+        // Disable configuration; the FPGA starts running.
+        self.ecp5_cmd_write(ecp5::ISC_DISABLE, &[], 0, max_bytes)?;
+        self.jtag_run_test(2)?;
+
+        let final_status = self.ecp5_status().unwrap_or(status_after_burst);
+        self.out_req(jtag::REQUEST_JTAG_STOP, 0, 0, &[])?;
+
+        if final_status & ecp5::STATUS_FAIL != 0 {
+            return Err(Error::Protocol(format!(
+                "configuration failed (status {final_status:#010x})"
+            )));
+        }
+        Ok(final_status)
+    }
+
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {
@@ -371,11 +568,20 @@ pub fn flash(bitstream: &[u8], target: FlashTarget) -> Result<()> {
         return Err(Error::Protocol("empty bitstream".into()));
     }
     let apollo = Apollo::open()?;
-    let _ = (target, &apollo);
-    Err(Error::Unsupported(
-        "Apollo link is up, but ECP5 bitstream playback (JTAG) is not yet \
-         implemented — that is the next step",
-    ))
+    match target {
+        FlashTarget::Sram => {
+            let status = apollo.configure_sram(bitstream)?;
+            if status & ecp5::STATUS_DONE == 0 {
+                return Err(Error::Protocol(format!(
+                    "bitstream loaded but DONE not set (status {status:#010x})"
+                )));
+            }
+            Ok(())
+        }
+        FlashTarget::Flash => Err(Error::Unsupported(
+            "persistent SPI-flash programming not yet implemented (SRAM works)",
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -963,30 +963,50 @@ fn drain_traced(
 /// Run an explicit source PD contract: advertise `pdos`, wait for the sink's
 /// Request, then send Accept + PS_RDY. Returns true if a Request was answered.
 /// `msg_id` is advanced as messages are sent.
-fn source_contract(
+/// Source-initiated PD negotiation with the timing the spec demands, worked
+/// around our slow JTAG-I2C link.
+///
+/// The sink only listens for Source_Capabilities for tSinkWaitCap (310–620 ms)
+/// after a fresh attach, and our per-transmit overhead is far larger than that —
+/// so we **pre-stage** the caps in the TX FIFO (slow), force a fresh attach by
+/// cycling VBUS, wait out the sink's attach debounce, then **fire** the staged
+/// message with one fast write so it lands inside the window. Then we stay quiet
+/// (half-duplex) and listen for the Request; on receiving it we send Accept +
+/// PS_RDY (best effort — the back half has ~15 ms timing we may not always meet).
+///
+/// Returns true if the sink sent a Request. `msg_id` is advanced per message.
+fn source_negotiate_timed(
     apollo: &usbmagic::flash::Apollo,
     line: usbmagic::flash::PdLine,
     cc: u8,
+    vbus_route: u8,
     trace: &mut PdTrace,
-    pdos: &[u32],
     msg_id: &mut u16,
 ) -> Result<bool> {
     use std::time::{Duration, Instant};
-    for attempt in 0..5 {
-        let caps = PdMessage::from_objects(source_header(1, pdos.len() as u16, *msg_id), pdos);
-        send_traced(apollo, line, cc, trace, &caps)?;
-        *msg_id = msg_id.wrapping_add(1);
-        // Did the partner GoodCRC our Source_Capabilities? (Hardware auto-retry
-        // already retransmitted up to 3× if not.) This is consumed by hardware,
-        // so it won't appear in the trace — report it explicitly.
-        match apollo.fusb302_tx_result(line)? {
-            Some(true) => eprintln!("  (Source_Capabilities #{attempt} ACKed by sink)"),
-            Some(false) => eprintln!("  (Source_Capabilities #{attempt} not ACKed — retries failed)"),
-            None => {}
+    const PDO_5V_1A5: u32 = (100 << 10) | 150; // 5 V @ 1.5 A fixed
+    for attempt in 0..4 {
+        let caps = PdMessage::from_objects(source_header(1, 1, *msg_id), &[PDO_5V_1A5]);
+        // 1. Slow part, done BEFORE the timing window: load the FIFO (no TXON).
+        apollo.fusb302_tx_stage(line, &caps.raw)?;
+        // 2. Force a fresh attach so the sink re-opens its tSinkWaitCap window.
+        if vbus_route != 0 {
+            cycle_vbus_target_c(apollo, vbus_route)?;
         }
-        // Listen quietly for the sink's Request (hardware auto-GoodCRCs it).
+        // 3. Wait out the sink's attach debounce (~tCCDebounce), still inside
+        //    tSinkWaitCap, then FIRE the staged caps with a single fast write.
+        std::thread::sleep(Duration::from_millis(180));
+        apollo.fusb302_tx_fire(line)?;
+        trace.record(iface_id(line), PdDirection::ToDut, PdSop::Sop, cc, None, &caps)?;
+        *msg_id = msg_id.wrapping_add(1);
+        match apollo.fusb302_tx_result(line)? {
+            Some(true) => eprintln!("  caps attempt #{attempt}: ACKed by sink (GoodCRC)"),
+            Some(false) => eprintln!("  caps attempt #{attempt}: not ACKed (retries failed)"),
+            None => eprintln!("  caps attempt #{attempt}: no TX result yet"),
+        }
+        // 4. Stay quiet and listen for the Request (hardware auto-GoodCRCs it).
         let window = Instant::now();
-        while window.elapsed() < Duration::from_millis(700) {
+        while window.elapsed() < Duration::from_millis(1200) {
             if let Some(raw) = apollo.fusb302_poll_message(line)? {
                 let m = PdMessage { raw };
                 let name = usbmagic::pd_message_name(&m);
@@ -995,14 +1015,13 @@ fn source_contract(
                     let accept = PdMessage::from_objects(source_header(3, 0, *msg_id), &[]);
                     send_traced(apollo, line, cc, trace, &accept)?;
                     *msg_id = msg_id.wrapping_add(1);
-                    std::thread::sleep(Duration::from_millis(5));
                     let rdy = PdMessage::from_objects(source_header(6, 0, *msg_id), &[]);
                     send_traced(apollo, line, cc, trace, &rdy)?;
                     *msg_id = msg_id.wrapping_add(1);
                     return Ok(true);
                 }
             } else {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(15));
             }
         }
     }
@@ -1158,15 +1177,10 @@ fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
 
     if args.negotiate {
         if matches!(args.role, RoleArg::Source) {
-            if vbus_route != 0 {
-                eprintln!("Cycling VBUS to force a fresh PD attach before negotiating...");
-                cycle_vbus_target_c(&apollo, vbus_route)?;
-            }
-            const PDO_5V_1A5: u32 = (100 << 10) | 150;
-            if source_contract(&apollo, line, cc, &mut trace, &[PDO_5V_1A5], &mut msg_id)? {
-                eprintln!("Explicit PD contract established.");
+            if source_negotiate_timed(&apollo, line, cc, vbus_route, &mut trace, &mut msg_id)? {
+                eprintln!("Got a Request from the sink — two-way PD achieved!");
             } else {
-                eprintln!("No Request from sink; sending without an explicit contract.");
+                eprintln!("No Request from sink yet; sending the rest without a contract.");
             }
         } else {
             eprintln!("note: --negotiate only applies to --role source; skipping.");

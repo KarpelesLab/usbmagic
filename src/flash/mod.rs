@@ -690,20 +690,28 @@ impl Apollo {
 
         // Present Rp on both CC and find the attached one: the sink's Rd pulls its
         // CC below the comparator threshold (COMP=0); the open CC stays high (COMP=1).
-        w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC1)?;
-        std::thread::sleep(Duration::from_millis(2));
-        let comp1 = r(REG_STATUS0)? & COMP;
-        w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC2)?;
-        std::thread::sleep(Duration::from_millis(2));
-        let comp2 = r(REG_STATUS0)? & COMP;
-
-        let cc = if comp1 == 0 {
-            1
-        } else if comp2 == 0 {
-            2
-        } else {
+        // A DRP sink (e.g. a phone) can take a moment to commit to UFP/sink after
+        // it sees our Rp, so poll for it rather than sampling once.
+        let mut cc = 0;
+        for _ in 0..15 {
+            w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC1)?;
+            std::thread::sleep(Duration::from_millis(5));
+            let comp1 = r(REG_STATUS0)? & COMP;
+            w(REG_SWITCHES0, PU_EN1 | PU_EN2 | MEAS_CC2)?;
+            std::thread::sleep(Duration::from_millis(5));
+            let comp2 = r(REG_STATUS0)? & COMP;
+            if comp1 == 0 {
+                cc = 1;
+                break;
+            } else if comp2 == 0 {
+                cc = 2;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if cc == 0 {
             return Ok(0); // no sink pulling either CC down
-        };
+        }
 
         let (pu, meas, txcc) = if cc == 1 {
             (PU_EN1, MEAS_CC1, TXCC1)
@@ -733,6 +741,36 @@ impl Apollo {
             let c0 = bus.read_reg(ADDR, REG_CONTROL0)?;
             bus.write_reg(ADDR, REG_CONTROL0, c0 | TX_FLUSH)?;
             bus.write_reg_multi(ADDR, REG_FIFOS, &seq)
+        })
+    }
+
+    /// Pre-load a PD message into the TX FIFO **without** the TXON trigger, so a
+    /// later [`fusb302_tx_fire`](Self::fusb302_tx_fire) can transmit it with a
+    /// single fast write. Used to hit tight PD timing windows over slow JTAG-I2C:
+    /// do the slow FIFO write ahead of time, then fire inside the window.
+    pub fn fusb302_tx_stage(&self, line: PdLine, raw: &[u8]) -> Result<()> {
+        use fusb302::*;
+        let regs = line.i2c_regs();
+        // Same token stream as fusb302_tx but ending at TXOFF (no TXON trigger).
+        let mut seq = vec![TX_SOP1, TX_SOP1, TX_SOP1, TX_SOP2, TX_PACKSYM | (raw.len() as u8)];
+        seq.extend_from_slice(raw);
+        seq.extend_from_slice(&[TX_JAM_CRC, TX_EOP, TX_OFF]);
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw, regs);
+            let c0 = bus.read_reg(ADDR, REG_CONTROL0)?;
+            bus.write_reg(ADDR, REG_CONTROL0, c0 | TX_FLUSH)?;
+            bus.write_reg_multi(ADDR, REG_FIFOS, &seq)
+        })
+    }
+
+    /// Transmit the message previously staged by
+    /// [`fusb302_tx_stage`](Self::fusb302_tx_stage): write the TXON token only.
+    pub fn fusb302_tx_fire(&self, line: PdLine) -> Result<()> {
+        use fusb302::*;
+        let regs = line.i2c_regs();
+        self.with_registers(|a, iw, dw| {
+            let mut bus = I2cBus::new(a, iw, dw, regs);
+            bus.write_reg_multi(ADDR, REG_FIFOS, &[TX_ON])
         })
     }
 

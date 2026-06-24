@@ -42,10 +42,44 @@ Great Scott Gadgets **Cynthion**, where:
 | Debug controller | **Apollo** MCU (USB `1d50:6018`) configures the FPGA | Gateware load/flash path |
 | Analyzer gateware | USB Analyzer (`1d50:615b`), already supported by this crate | Reuse its ULPI/UTMI + timestamping primitives |
 
-> **To confirm from the KiCad schematics** (`type_c`, `usb_phy`, `power_distribution`,
-> `power_supplies`) before Phase 1: exact TARGET-A/TARGET-C/AUX/CONTROL port roles and
-> pass-through wiring; whether the **FPGA or the Apollo MCU owns the I2C buses** to the
-> FUSB302B and PAC1954; VBUS load-switch control nets; D±​ pulldown handling in host mode.
+### 2.1 Resolved from the KiCad schematics + r1.4 Amaranth platform
+
+Confirmed by reading `greatscottgadgets/cynthion-hardware` (KiCad) and the
+`cynthion_r1_4.py` platform:
+
+**I2C ownership — the FPGA owns all of it; the Apollo SAMD11 does not.** The
+debugger sheet carries only JTAG / FPGA-config / SWD / LEDs (no I2C). PD and
+power-monitor I2C are FPGA GPIO **bit-banged** (SCL `dir="o"`, SDA `dir="io"`) on
+**three independent buses** — the two FUSB302Bs are both `FUSB302BMPX` (I2C addr
+**0x22**), so they cannot share a bus:
+
+| Device (resource) | SCL | SDA | INT# | FAULT# | extra |
+|---|---|---|---|---|---|
+| AUX PD `aux_type_c` (FUSB302B) | H12 | G14 | H14 | J14 | SBU1 H13, SBU2 K14 |
+| TARGET-C PD `target_type_c` (FUSB302B) | A4 | C4 | A3 | D4 | SBU1 A2, SBU2 E4 |
+| Power monitor `power_monitor` (PAC1954) | D7 | C7 | — | — | PWRDN# D5, SLOW C6, GPIO D6 |
+
+→ PD, VCONN, and power telemetry are fully driveable from our gateware/Rust — **no
+MCU firmware dependency**. VCONN is an internal FUSB302B register function (no
+dedicated FPGA pin). SBU1/SBU2 reach the FPGA (useful for AltMode / debug-accessory work).
+
+**Port roles & pass-through.**
+- **CONTROL** (USB-C): ULPI `control_phy`; CC1/CC2 are passive sense only (**no PD
+  controller**). Operator-host link; carries the command protocol.
+- **AUX** (USB-C): ULPI `aux_phy` + FUSB302B `aux_type_c` (bidirectional PD/VCONN/SBU).
+- **TARGET-A + TARGET-C**: the DUT pass-through pair share a **single** ULPI
+  `target_phy` (both connectors' D±​ tie to it, one used at a time). TARGET-C adds
+  FUSB302B `target_type_c`. Also exposed: direct `target_usb_dp`/`target_usb_dm` and
+  `target_usb_dp_chirp`/`target_usb_dm_chirp` lines + a full-speed monitor tap — exactly
+  what host-side **reset + chirp** speed negotiation needs. **The host-mode DUT connects
+  to TARGET, driven by `target_phy`, and is never on the operator bus.**
+
+**VBUS / power control (FPGA outputs):** `aux_vbus_en`, `aux_vbus_in_en`,
+`control_vbus_en`, `control_vbus_in_en`, `target_c_vbus_en`, `target_a_discharge`;
+per-port V/I via the PAC1954. `clk_60MHz` is the ULPI/timestamp clock.
+
+**Tooling implication:** the r1.4 Amaranth platform already names every resource above,
+so gateware references them by name — **no manual pin constraints needed**.
 
 ## 3. System architecture
 
@@ -216,7 +250,8 @@ cocotb for gateware, Rust unit + hardware-in-the-loop.
 - HS host timing on the ECP5 + the known **FIFO-overrun** at HS bulk rates.
 - USB3343 **host-mode** register configuration quirks; VBUS sourced via external load
   switch (not the PHY); D±​ pulldown handling.
-- **I2C bus ownership** (FPGA vs Apollo MCU) for FUSB302B / PAC1954 — confirm from schematic.
+- ~~I2C bus ownership (FPGA vs Apollo MCU)~~ — **resolved: FPGA owns all three I2C
+  buses** (see §2.1); Apollo only does config/JTAG/SWD.
 - **Single board:** limited independent verification of the host's wire output (mitigate
   with the built-in wire log, simulation, or a second Cynthion in analyzer mode).
 - A SuperSpeed **host** in gateware (Phase 7) has little/no public prior art.

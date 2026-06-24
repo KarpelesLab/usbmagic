@@ -39,7 +39,7 @@ Great Scott Gadgets **Cynthion**, where:
 | USB-C SuperSpeed | SS pairs **not** routed to ECP5 SERDES | USB 3.0 **impossible** on this board |
 | Type-C / PD | Type-C controller on **TARGET-C** + **AUX**, **bidirectional PD** on CC pins, **VCONN output** (per GSG; FUSB302B-class, I2C) | **Custom PD / CC messaging is feasible** (BMC in silicon); can power+interrogate **e-marked cables** via VCONN |
 | Power monitor | **PAC1954** 4-channel V/I monitor (I2C) | Per-port VBUS voltage/current telemetry for forensics |
-| Debug controller | **Apollo** MCU (USB `1d50:6018`) configures the FPGA | Gateware load/flash path |
+| Debug controller | **Apollo** stub on the SAMD11 MCU (USB `1d50:615c`; `6018` is the legacy standalone Apollo) configures the FPGA | Gateware load/flash path |
 | Analyzer gateware | USB Analyzer (`1d50:615b`), already supported by this crate | Reuse its ULPI/UTMI + timestamping primitives |
 
 ### 2.1 Resolved from the KiCad schematics + r1.4 Amaranth platform

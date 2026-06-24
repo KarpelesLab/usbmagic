@@ -1,0 +1,31 @@
+[package]
+name = "usbmagic"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Library and CLI for magic USB ports (USB test instruments), starting with the Great Scott Gadgets Cynthion USB analyzer"
+license = "BSD-3-Clause"
+repository = "https://github.com/KarpelesLab/usbmagic"
+readme = "README.md"
+keywords = ["usb", "cynthion", "analyzer", "pcap", "nusb"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[lib]
+name = "usbmagic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "usbmagic"
+path = "src/main.rs"
+
+[dependencies]
+nusb = "0.2.4"
+thiserror = "2"
+
+# Binary-only dependencies.
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+ctrlc = "3"
+
+[profile.release]
+lto = "thin"

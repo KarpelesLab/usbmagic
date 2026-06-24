@@ -19,7 +19,10 @@ else
     run_id="$(gh run list --repo "$REPO" --workflow build --status success \
                 --limit 1 --json databaseId -q '.[0].databaseId')"
     [ -n "${run_id:-}" ] || { echo "ERROR: no successful build run found on $REPO" >&2; exit 1; }
-    gh run download "$run_id" --repo "$REPO" --name usbmagic-blinky-bitstream --dir "$DEST"
+    tmp="$(mktemp -d)"
+    gh run download "$run_id" --repo "$REPO" --name usbmagic-bitstreams --dir "$tmp"
+    cp -f "$tmp"/*.bit "$DEST"/
+    rm -rf "$tmp"
     source="ci-run $run_id"
 fi
 

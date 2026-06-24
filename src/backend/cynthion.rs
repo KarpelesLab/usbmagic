@@ -14,6 +14,8 @@
 //! `LICENSE` file; the original copyright is retained as required.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
@@ -38,6 +40,10 @@ const ENDPOINT: u8 = 0x81;
 const READ_LEN: usize = 0x4000;
 /// Control transfer timeout.
 const TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a capture read blocks before returning so we can check for a stop
+/// request. The analyzer is passive: with no traffic the bulk IN endpoint never
+/// returns data, so without this a stop/duration/Ctrl-C could never interrupt it.
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 // Vendor request numbers (recipient = interface).
 const REQ_GET_STATE: u8 = 0;
@@ -130,13 +136,15 @@ impl MagicDevice for CynthionDevice {
         let reader = self
             .interface
             .endpoint::<Bulk, In>(ENDPOINT)?
-            .reader(READ_LEN);
+            .reader(READ_LEN)
+            .with_read_timeout(READ_TIMEOUT);
 
         Ok(CaptureStream::new(Box::new(CynthionCapture {
             reader: Box::new(reader),
             interface: self.interface.clone(),
             iface_num: self.iface_num,
             stop_state,
+            stop: Arc::new(AtomicBool::new(false)),
             parser: RecordParser::new(),
             scratch: vec![0u8; READ_LEN],
             done: false,
@@ -219,6 +227,8 @@ struct CynthionCapture {
     iface_num: u8,
     /// State byte to write to disable capture.
     stop_state: u8,
+    /// Shared flag: set to request the capture loop to end at the next read tick.
+    stop: Arc<AtomicBool>,
     parser: RecordParser,
     /// Reusable read buffer.
     scratch: Vec<u8>,
@@ -232,7 +242,8 @@ impl Iterator for CynthionCapture {
     type Item = Result<CaptureItem>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.done || self.stop.load(Ordering::Relaxed) {
+            self.done = true;
             return None;
         }
         loop {
@@ -247,6 +258,19 @@ impl Iterator for CynthionCapture {
                 Ok(n) => {
                     let chunk = self.scratch[..n].to_vec();
                     self.parser.extend(&chunk);
+                }
+                // A read timeout just means no traffic arrived in this window.
+                // End the stream if a stop was requested, otherwise keep waiting.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if self.stop.load(Ordering::Relaxed) {
+                        self.done = true;
+                        return None;
+                    }
                 }
                 Err(e) => {
                     self.done = true;
@@ -263,6 +287,7 @@ impl CaptureSource for CynthionCapture {
             return Ok(());
         }
         self.stopped = true;
+        self.stop.store(true, Ordering::Relaxed);
         write_state(&self.interface, self.iface_num, self.stop_state)
     }
 
@@ -270,7 +295,11 @@ impl CaptureSource for CynthionCapture {
         let interface = self.interface.clone();
         let iface_num = self.iface_num;
         let stop_state = self.stop_state;
-        Box::new(move || write_state(&interface, iface_num, stop_state))
+        let flag = self.stop.clone();
+        Box::new(move || {
+            flag.store(true, Ordering::Relaxed);
+            write_state(&interface, iface_num, stop_state)
+        })
     }
 }
 

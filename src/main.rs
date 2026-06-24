@@ -206,18 +206,29 @@ fn cmd_info(device: Option<&str>) -> Result<()> {
 }
 
 fn cmd_capture(args: CaptureArgs) -> Result<()> {
-    let speed: Speed = args.speed.into();
+    let requested: Speed = args.speed.into();
     let mut dev = select(args.device.as_deref())?;
 
-    let supported = &dev.capabilities().supported_speeds;
-    if !supported.contains(&speed) {
+    let supported = dev.capabilities().supported_speeds.clone();
+    let speed = if supported.contains(&requested) {
+        requested
+    } else if requested == Speed::Auto {
+        // This gateware doesn't advertise auto-detect; pick the fastest speed
+        // it does support.
+        let chosen = [Speed::High, Speed::Full, Speed::Low]
+            .into_iter()
+            .find(|s| supported.contains(s))
+            .context("device reports no usable capture speeds")?;
+        eprintln!("note: device has no auto-detect; capturing at {chosen} speed");
+        chosen
+    } else {
         let list = supported
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        bail!("device does not support {speed} speed (supported: {list})");
-    }
+        bail!("device does not support {requested} speed (supported: {list})");
+    };
 
     let opts = CaptureOptions {
         speed,

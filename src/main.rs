@@ -924,11 +924,10 @@ fn make_trace(dump: Option<&str>) -> Result<PdTrace> {
 }
 
 /// 16-bit PD message header for a message we originate as a source/DFP, Spec
-/// Rev 2.0 (power-role=source, data-role=DFP). `msg_type` in bits 0–4, MessageID
-/// in 9–11, number of data objects in 12–14. Matches the working 0x1161 used for
-/// Source_Capabilities with one PDO.
+/// Rev 3.0 (power-role=source bit8, data-role=DFP bit5, SpecRev=10 bits6-7).
+/// `msg_type` in bits 0–4, MessageID in 9–11, number of data objects in 12–14.
 fn source_header(msg_type: u16, ndo: u16, msg_id: u16) -> u16 {
-    0x0160 | (msg_type & 0x1F) | ((msg_id & 0x7) << 9) | ((ndo & 0x7) << 12)
+    0x01A0 | (msg_type & 0x1F) | ((msg_id & 0x7) << 9) | ((ndo & 0x7) << 12)
 }
 
 /// Transmit a PD message and record it (direction = to DUT).

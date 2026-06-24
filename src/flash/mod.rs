@@ -711,7 +711,8 @@ impl Apollo {
             (PU_EN2, MEAS_CC2, TXCC2)
         };
         w(REG_SWITCHES0, pu | meas)?;
-        w(REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_2_0 | POWERROLE | DATAROLE)?;
+        // Advertise/auto-GoodCRC as PD Rev 3.0 (modern sinks like phones expect it).
+        w(REG_SWITCHES1, txcc | AUTO_CRC | SPECREV_3_0 | POWERROLE | DATAROLE)?;
         w(REG_CONTROL1, RX_FLUSH)?;
         Ok(cc)
     }
@@ -855,6 +856,7 @@ mod fusb302 {
     pub const AUTO_CRC: u8 = 1 << 2;
     pub const DATAROLE: u8 = 1 << 4; // 1 = DFP
     pub const SPECREV_2_0: u8 = 0b01 << 5;
+    pub const SPECREV_3_0: u8 = 0b10 << 5;
     pub const POWERROLE: u8 = 1 << 7; // 1 = source
 
     // CONTROL0 bits.

@@ -198,6 +198,178 @@ fn push_option(body: &mut Vec<u8>, code: u16, value: &[u8]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reader: parse a pcapng file back into interfaces + packets, and decode the
+// USB-PD pseudo-header. Used by `usbmagic pd-dump`.
+// ---------------------------------------------------------------------------
+
+/// One interface (IDB) read from a pcapng file.
+#[derive(Debug, Clone)]
+pub struct PcapNgInterface {
+    /// `if_name` option, if present (e.g. "TARGET-C").
+    pub name: Option<String>,
+    /// Link type for this interface.
+    pub linktype: u32,
+    /// `if_tsresol`: timestamp units are 10^-tsresol seconds (decimal form).
+    pub tsresol: u8,
+}
+
+/// One captured packet (EPB) read from a pcapng file.
+#[derive(Debug, Clone)]
+pub struct PcapNgPacket {
+    /// Index into the interface table.
+    pub iface_id: u32,
+    /// Raw timestamp in the interface's `tsresol` units since the Unix epoch.
+    pub ts: u64,
+    /// Captured link-layer bytes (pseudo-header + PD message for our link type).
+    pub data: Vec<u8>,
+}
+
+/// Parsed contents of a pcapng file.
+#[derive(Debug, Clone)]
+pub struct PcapNg {
+    /// Interfaces, in IDB order (index = interface id).
+    pub interfaces: Vec<PcapNgInterface>,
+    /// Captured packets, in file order.
+    pub packets: Vec<PcapNgPacket>,
+}
+
+fn rd_u16(b: &[u8], le: bool) -> u16 {
+    let a = [b[0], b[1]];
+    if le {
+        u16::from_le_bytes(a)
+    } else {
+        u16::from_be_bytes(a)
+    }
+}
+fn rd_u32(b: &[u8], le: bool) -> u32 {
+    let a = [b[0], b[1], b[2], b[3]];
+    if le {
+        u32::from_le_bytes(a)
+    } else {
+        u32::from_be_bytes(a)
+    }
+}
+
+/// Parse a pcapng byte stream into interfaces and packets. Handles both byte
+/// orders; ignores block and option types it doesn't need.
+pub fn parse_pcapng(buf: &[u8]) -> std::result::Result<PcapNg, String> {
+    let mut le = true;
+    let mut interfaces: Vec<PcapNgInterface> = Vec::new();
+    let mut packets: Vec<PcapNgPacket> = Vec::new();
+    let mut off = 0usize;
+    while off + 12 <= buf.len() {
+        // The SHB block type (0x0A0D0D0A) is byte-order independent; use it to
+        // (re)detect endianness from the byte-order magic before reading lengths.
+        if buf[off..off + 4] == [0x0A, 0x0D, 0x0D, 0x0A] {
+            if off + 12 > buf.len() {
+                break;
+            }
+            le = buf[off + 8..off + 12] == [0x4D, 0x3C, 0x2B, 0x1A];
+        }
+        let total = rd_u32(&buf[off + 4..off + 8], le) as usize;
+        if total < 12 || off + total > buf.len() {
+            break;
+        }
+        let bt = rd_u32(&buf[off..off + 4], le);
+        let body = &buf[off + 8..off + total - 4];
+        match bt {
+            // Interface Description Block.
+            0x0000_0001 if body.len() >= 8 => {
+                let linktype = rd_u16(&body[0..2], le) as u32;
+                let mut name = None;
+                let mut tsresol = 6u8;
+                let mut o = 8usize;
+                while o + 4 <= body.len() {
+                    let code = rd_u16(&body[o..o + 2], le);
+                    let len = rd_u16(&body[o + 2..o + 4], le) as usize;
+                    o += 4;
+                    if code == 0 || o + len > body.len() {
+                        break;
+                    }
+                    match code {
+                        2 => name = Some(String::from_utf8_lossy(&body[o..o + len]).into_owned()),
+                        9 if len >= 1 => tsresol = body[o],
+                        _ => {}
+                    }
+                    o += len + ((4 - len % 4) % 4);
+                }
+                interfaces.push(PcapNgInterface { name, linktype, tsresol });
+            }
+            // Enhanced Packet Block.
+            0x0000_0006 if body.len() >= 20 => {
+                let iface_id = rd_u32(&body[0..4], le);
+                let ts = ((rd_u32(&body[4..8], le) as u64) << 32) | rd_u32(&body[8..12], le) as u64;
+                let caplen = rd_u32(&body[12..16], le) as usize;
+                let end = (20 + caplen).min(body.len());
+                packets.push(PcapNgPacket {
+                    iface_id,
+                    ts,
+                    data: body[20..end].to_vec(),
+                });
+            }
+            _ => {} // SHB, short blocks, and anything else: skip
+        }
+        off += total;
+    }
+    if interfaces.is_empty() && packets.is_empty() {
+        return Err("no pcapng blocks found".into());
+    }
+    Ok(PcapNg { interfaces, packets })
+}
+
+/// A decoded [`LINKTYPE_USB_TYPE_C_PD`] pseudo-header.
+#[derive(Debug, Clone, Copy)]
+pub struct PdPseudoHeader {
+    /// Pseudo-header version.
+    pub version: u8,
+    /// Raw SOP type byte (see [`sop_name`]).
+    pub sop: u8,
+    /// Message direction.
+    pub direction: PdDirection,
+    /// CC line (1 or 2).
+    pub cc: u8,
+    /// On-wire CRC-32, if it was captured.
+    pub crc: Option<u32>,
+}
+
+/// Decode the 8-byte USB-PD pseudo-header at the start of `d` (the PD message
+/// follows at `d[8..]`). Returns `None` if `d` is too short.
+pub fn parse_pd_pseudo_header(d: &[u8]) -> Option<PdPseudoHeader> {
+    if d.len() < 8 {
+        return None;
+    }
+    let flags = d[3];
+    let crc = (flags & FLAG_CRC_PRESENT != 0)
+        .then(|| u32::from_le_bytes([d[4], d[5], d[6], d[7]]));
+    let direction = if d[2] == 1 {
+        PdDirection::ToDut
+    } else {
+        PdDirection::FromDut
+    };
+    Some(PdPseudoHeader {
+        version: d[0],
+        sop: d[1],
+        direction,
+        cc: if flags & FLAG_CC2 != 0 { 2 } else { 1 },
+        crc,
+    })
+}
+
+/// Human-readable name for a pseudo-header `sop_type` byte.
+pub fn sop_name(v: u8) -> &'static str {
+    match v {
+        0 => "SOP",
+        1 => "SOP'",
+        2 => "SOP''",
+        3 => "SOP'_Debug",
+        4 => "SOP''_Debug",
+        5 => "Hard Reset",
+        6 => "Cable Reset",
+        _ => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +436,37 @@ mod tests {
         assert_eq!(&epb[28..31], &[0xAA, 0xBB, 0xCC]);
         assert_eq!(epb.len() % 4, 0);
         assert_eq!(&epb[epb.len() - 4..], &36u32.to_le_bytes()); // trailing length
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let ifaces = [
+            IfaceDesc { name: "TARGET-C", linktype: LINKTYPE_USB_TYPE_C_PD, snaplen: 4096 },
+            IfaceDesc { name: "AUX", linktype: LINKTYPE_USB_TYPE_C_PD, snaplen: 4096 },
+        ];
+        let mut w = PcapNgWriter::new(Vec::new(), &ifaces).unwrap();
+        let mut pkt = pd_pseudo_header(PdSop::Sop, PdDirection::ToDut, 1, None).to_vec();
+        pkt.extend_from_slice(&[0x6f, 0x11, 0x01, 0x80, 0xac, 0x05]); // a VDM
+        w.write_packet(0, 1_700_000_000_000_000, &pkt).unwrap();
+        let buf = w.out;
+
+        let parsed = parse_pcapng(&buf).unwrap();
+        assert_eq!(parsed.interfaces.len(), 2);
+        assert_eq!(parsed.interfaces[0].name.as_deref(), Some("TARGET-C"));
+        assert_eq!(parsed.interfaces[1].name.as_deref(), Some("AUX"));
+        assert_eq!(parsed.interfaces[0].linktype, LINKTYPE_USB_TYPE_C_PD);
+        assert_eq!(parsed.packets.len(), 1);
+        let p = &parsed.packets[0];
+        assert_eq!(p.iface_id, 0);
+        assert_eq!(p.ts, 1_700_000_000_000_000);
+        assert_eq!(p.data, pkt);
+
+        let ph = parse_pd_pseudo_header(&p.data).unwrap();
+        assert_eq!(ph.version, 1);
+        assert_eq!(ph.sop, 0);
+        assert_eq!(ph.direction, PdDirection::ToDut);
+        assert_eq!(ph.cc, 1);
+        assert_eq!(ph.crc, None);
+        assert_eq!(&p.data[8..], &[0x6f, 0x11, 0x01, 0x80, 0xac, 0x05]);
     }
 }

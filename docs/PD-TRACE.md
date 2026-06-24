@@ -64,6 +64,25 @@ Unix epoch.
 > The Cynthion's FUSB302B controllers check/append the CRC in hardware, so the
 > on-wire CRC octets aren't exposed; captured frames clear `CRC_PRESENT`.
 
+### Reading a trace back
+
+Since no Wireshark dissector exists for this link type yet, `usbmagic pd-dump`
+decodes our pcapng files directly:
+
+```sh
+usbmagic pd-dump /tmp/pd.pcapng          # decoded, human-readable
+usbmagic pd-dump /tmp/pd.pcapng --hex    # also show the raw link-layer bytes
+```
+
+It lists the interfaces (ports) and prints each message with its direction,
+relative timestamp, decoded name/header, the port, SOP type, CC line, and CRC
+status — e.g.:
+
+```
+#1   [  0.000s] TX -> Vendor_Defined       hdr=0x116f obj=1 raw=6f110180ac05
+       port=TARGET-C sop=SOP cc1 crc=n/a (hw AUTO_CRC)
+```
+
 ### Opening in Wireshark
 
 There is no USB-PD dissector keyed on this (still-unallocated) link type yet, so

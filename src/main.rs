@@ -48,6 +48,8 @@ enum Command {
     /// Send custom PD message(s) — raw bytes and/or a structured VDM — to a
     /// device, tracing the full bidirectional exchange.
     PdSend(PdSendArgs),
+    /// Decode a pcapng PD trace (LINKTYPE_USB_TYPE_C_PD) into human-readable form.
+    PdDump(PdDumpArgs),
     /// Charge a device on TARGET-C at 5 V, sourced from a supply on AUX.
     Charge,
 }
@@ -190,6 +192,17 @@ struct PdSendArgs {
     dump: Option<String>,
 }
 
+/// Arguments for `pd-dump`.
+#[derive(Args)]
+struct PdDumpArgs {
+    /// The pcapng file to decode.
+    file: String,
+
+    /// Also show the raw link-layer bytes (pseudo-header + message) per packet.
+    #[arg(long)]
+    hex: bool,
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 enum RoleArg {
     /// Present Rp (we are the power source / DFP).
@@ -277,6 +290,7 @@ fn main() -> Result<()> {
         Command::PdListen(args) => cmd_pd_listen(args),
         Command::PdSource(args) => cmd_pd_source(args),
         Command::PdSend(args) => cmd_pd_send(args),
+        Command::PdDump(args) => cmd_pd_dump(args),
         Command::Charge => cmd_charge(),
     }
 }
@@ -1165,6 +1179,73 @@ fn cmd_pd_send(args: PdSendArgs) -> Result<()> {
     eprintln!("Done — {} PD message(s) traced.", trace.count());
     if let Some(d) = &args.dump {
         eprintln!("Wrote pcapng trace to {d} (LINKTYPE_USB_TYPE_C_PD).");
+    }
+    Ok(())
+}
+
+fn cmd_pd_dump(args: PdDumpArgs) -> Result<()> {
+    use usbmagic::{
+        format_pd_message, parse_pcapng, parse_pd_pseudo_header, sop_name, LINKTYPE_USB_TYPE_C_PD,
+    };
+
+    let buf = std::fs::read(&args.file).with_context(|| format!("reading {}", args.file))?;
+    let png = parse_pcapng(&buf).map_err(|e| anyhow::anyhow!("not a valid pcapng: {e}"))?;
+
+    println!("{} interface(s):", png.interfaces.len());
+    for (i, iface) in png.interfaces.iter().enumerate() {
+        let known = if iface.linktype == LINKTYPE_USB_TYPE_C_PD {
+            " = USB_TYPE_C_PD"
+        } else {
+            ""
+        };
+        println!(
+            "  [{i}] {} (linktype {}{known})",
+            iface.name.as_deref().unwrap_or("?"),
+            iface.linktype,
+        );
+    }
+    println!("{} packet(s):", png.packets.len());
+
+    let base = png.packets.first().map(|p| p.ts).unwrap_or(0);
+    for (idx, p) in png.packets.iter().enumerate() {
+        let iface = png.interfaces.get(p.iface_id as usize);
+        let port = iface.and_then(|i| i.name.as_deref()).unwrap_or("?");
+        let tsresol = iface.map(|i| i.tsresol).unwrap_or(6);
+        let ts_rel = p.ts.saturating_sub(base) as f64 / 10f64.powi(tsresol as i32);
+        let lt = iface.map(|i| i.linktype).unwrap_or(0);
+
+        if lt == LINKTYPE_USB_TYPE_C_PD {
+            if let Some(ph) = parse_pd_pseudo_header(&p.data) {
+                let msg = PdMessage {
+                    raw: p.data[8..].to_vec(),
+                };
+                println!(
+                    "{}",
+                    format_pd_message((idx + 1) as u32, ts_rel, ph.direction, &msg)
+                );
+                let crc = ph
+                    .crc
+                    .map(|c| format!("{c:#010x}"))
+                    .unwrap_or_else(|| "n/a (hw AUTO_CRC)".into());
+                println!(
+                    "       port={port} sop={} cc{} crc={crc}",
+                    sop_name(ph.sop),
+                    ph.cc
+                );
+                if args.hex {
+                    let hex: String = p.data.iter().map(|b| format!("{b:02x}")).collect();
+                    println!("       bytes={hex}");
+                }
+                continue;
+            }
+        }
+        // Unknown / non-PD link type: show what we can.
+        let hex: String = p.data.iter().map(|b| format!("{b:02x}")).collect();
+        println!(
+            "#{:<3} [{ts_rel:7.3}s] iface={port} linktype={lt} {} bytes raw={hex}",
+            idx + 1,
+            p.data.len(),
+        );
     }
     Ok(())
 }

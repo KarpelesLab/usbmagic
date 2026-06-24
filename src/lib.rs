@@ -45,6 +45,9 @@ pub use error::{Error, Result};
 pub use host::{
     DeviceDescriptor, Direction, EnumeratedDevice, Handshake, Pid, RawTransaction, Setup, UsbHost,
 };
-pub use pcapng::{pd_pseudo_header, PcapNgWriter, PdDirection, PdSop, LINKTYPE_USB_TYPE_C_PD};
+pub use pcapng::{
+    parse_pcapng, parse_pd_pseudo_header, pd_pseudo_header, sop_name, PcapNg, PcapNgInterface,
+    PcapNgPacket, PcapNgWriter, PdDirection, PdPseudoHeader, PdSop, LINKTYPE_USB_TYPE_C_PD,
+};
 pub use pd::{format_pd_message, pd_message_name, PdMessage, PdPort, PdTrace, PowerDelivery, Vdm};
 pub use power::{MonitoredPort, PortPower, PowerMonitor};

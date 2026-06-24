@@ -494,6 +494,110 @@ impl Apollo {
         Ok(final_status)
     }
 
+    // --- Meta-JTAG register access (LUNA JTAGRegisterInterface) ---
+    //
+    // Gateware built with LUNA's JTAGRegisterInterface exposes a CSR bank over
+    // two ECP5 user-JTAG registers: IR 0x32 selects the address/instruction
+    // register, IR 0x38 the data register. Ported from GSG Apollo
+    // (ECP5_JTAGRegisters).
+
+    /// Shift `nbits` of big-endian `data` through DR and return the read-back
+    /// bytes (little-endian value order), ending in DRPAUSE.
+    fn jtag_dr_xfer(&self, be_data: &[u8], nbits: u16) -> Result<Vec<u8>> {
+        self.jtag_go(jtag::STATE_DRSHIFT)?;
+        let wire: Vec<u8> = be_data.iter().rev().copied().collect();
+        self.out_req(jtag::REQUEST_JTAG_SET_OUT_BUFFER, 0, 0, &wire)?;
+        self.out_req(jtag::REQUEST_JTAG_SCAN, nbits, 1, &[])?; // advance on last bit
+        let buf = self.in_req(jtag::REQUEST_JTAG_GET_IN_BUFFER, 0, 0, nbits.div_ceil(8))?;
+        self.jtag_go(jtag::STATE_DRPAUSE)?;
+        Ok(buf)
+    }
+
+    /// Auto-detect a meta-register width by shifting 128 bits and counting the
+    /// leading 1s the gateware pre-loads.
+    fn jtag_meta_width(&self, opcode: u8) -> Result<usize> {
+        self.jtag_shift_ir(opcode)?;
+        self.jtag_go(jtag::STATE_DRSHIFT)?;
+        self.out_req(jtag::REQUEST_JTAG_CLEAR_OUT_BUFFER, 0, 0, &[])?;
+        self.out_req(jtag::REQUEST_JTAG_SCAN, 128, 0, &[])?; // read-only, no advance
+        let buf = self.in_req(jtag::REQUEST_JTAG_GET_IN_BUFFER, 0, 0, 16)?;
+        self.jtag_go(jtag::STATE_DRPAUSE)?;
+        let mut count = 0usize;
+        'outer: for &byte in &buf {
+            for bit in (0..8).rev() {
+                if (byte >> bit) & 1 == 1 {
+                    count += 1;
+                } else {
+                    break 'outer;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn meta_txn(
+        &self,
+        addr: u8,
+        is_write: bool,
+        value: u32,
+        iw: usize,
+        dw: usize,
+    ) -> Result<u32> {
+        let iw_bytes = iw.div_ceil(8);
+        let dw_bytes = dw.div_ceil(8);
+        if iw == 0 || dw == 0 || iw > 32 || dw > 32 {
+            return Err(Error::Protocol(format!(
+                "implausible register widths (instr {iw}, data {dw})"
+            )));
+        }
+        let write_flag = if is_write { 1u32 << (iw - 1) } else { 0 };
+        let cmd = write_flag | u32::from(addr);
+
+        // Select + write the address/instruction register.
+        self.jtag_shift_ir(0x32)?;
+        self.jtag_dr_xfer(&cmd.to_be_bytes()[4 - iw_bytes..], iw as u16)?;
+        self.jtag_run_test(32)?;
+
+        // Select the data register; write value / read result.
+        self.jtag_shift_ir(0x38)?;
+        let buf = self.jtag_dr_xfer(&value.to_be_bytes()[4 - dw_bytes..], dw as u16)?;
+        self.jtag_run_test(32)?;
+
+        let mut v = 0u32;
+        for (i, b) in buf.iter().take(dw_bytes).enumerate() {
+            v |= u32::from(*b) << (8 * i);
+        }
+        Ok(v)
+    }
+
+    /// Open a JTAG meta-register session (auto-detecting widths) and run `f`.
+    fn with_registers<T>(&self, f: impl FnOnce(&Self, usize, usize) -> Result<T>) -> Result<T> {
+        self.out_req(jtag::REQUEST_JTAG_START, 0, 0, &[])?;
+        self.jtag_go(jtag::STATE_RESET)?;
+        // Read data width before instruction width (scanning the instruction
+        // register latches the data register).
+        let dw = self.jtag_meta_width(0x38)?;
+        let iw = self.jtag_meta_width(0x32)?;
+        let r = f(self, iw, dw);
+        let _ = self.out_req(jtag::REQUEST_JTAG_STOP, 0, 0, &[]);
+        r
+    }
+
+    /// Read a gateware CSR register (auto-detects widths each call).
+    pub fn register_read(&self, addr: u8) -> Result<u32> {
+        self.with_registers(|a, iw, dw| a.meta_txn(addr, false, 0, iw, dw))
+    }
+
+    /// Write a gateware CSR register.
+    pub fn register_write(&self, addr: u8, value: u32) -> Result<()> {
+        self.with_registers(|a, iw, dw| a.meta_txn(addr, true, value, iw, dw).map(|_| ()))
+    }
+
+    /// Auto-detected (instruction_width, data_width) of the gateware register bank.
+    pub fn register_widths(&self) -> Result<(usize, usize)> {
+        self.with_registers(|_, iw, dw| Ok((iw, dw)))
+    }
+
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {

@@ -33,6 +33,8 @@ enum Command {
     Flash(FlashArgs),
     /// Connect to the Cynthion's Apollo debugger (identity, firmware, reconfigure).
     Apollo(ApolloArgs),
+    /// Flash the PD-bridge gateware and probe its registers (FUSB302B I2C lines).
+    PdProbe,
 }
 
 #[derive(Args)]
@@ -118,6 +120,7 @@ fn main() -> Result<()> {
         Command::Capture(args) => cmd_capture(args),
         Command::Flash(args) => cmd_flash(args),
         Command::Apollo(args) => cmd_apollo(args),
+        Command::PdProbe => cmd_pd_probe(),
     }
 }
 
@@ -457,5 +460,35 @@ fn cmd_apollo(args: ApolloArgs) -> Result<()> {
         apollo.reconfigure()?;
         eprintln!("Done.");
     }
+    Ok(())
+}
+
+fn cmd_pd_probe() -> Result<()> {
+    use usbmagic::flash::Apollo;
+
+    let path = "firmware/usbmagic-pd-bridge.bit";
+    let bitstream = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+
+    let apollo = Apollo::open().context("opening Apollo")?;
+    eprintln!("Flashing pd_bridge ({} bytes) to SRAM...", bitstream.len());
+    let status = apollo.configure_sram(&bitstream)?;
+    eprintln!("Configured (status {status:#010x}).");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let (iw, dw) = apollo.register_widths()?;
+    eprintln!("Register widths: instruction={iw} bits, data={dw} bits.");
+
+    let id = apollo.register_read(1)?; // REG_ID
+    println!(
+        "REG_ID      = {id:#010x} {}",
+        if id == 0x7550_4442 { "(uPDB ✓)" } else { "(unexpected!)" }
+    );
+
+    let gpio_in = apollo.register_read(3)?; // REG_GPIO_IN: bit0=SDA, bit1=INT#
+    println!(
+        "REG_GPIO_IN = {gpio_in:#x}  (SDA={}, FUSB302B_INT={})",
+        gpio_in & 1,
+        (gpio_in >> 1) & 1
+    );
     Ok(())
 }

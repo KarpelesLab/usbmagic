@@ -31,6 +31,8 @@ enum Command {
     Capture(CaptureArgs),
     /// Flash gateware to the Cynthion's FPGA (over Apollo).
     Flash(FlashArgs),
+    /// Connect to the Cynthion's Apollo debugger (identity, firmware, reconfigure).
+    Apollo(ApolloArgs),
 }
 
 #[derive(Args)]
@@ -101,6 +103,13 @@ struct FlashArgs {
     persistent: bool,
 }
 
+#[derive(Args)]
+struct ApolloArgs {
+    /// After reading identity, reconfigure the FPGA from flash (restore gateware).
+    #[arg(long)]
+    reconfigure: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -108,6 +117,7 @@ fn main() -> Result<()> {
         Command::Info(sel) => cmd_info(sel.device.as_deref()),
         Command::Capture(args) => cmd_capture(args),
         Command::Flash(args) => cmd_flash(args),
+        Command::Apollo(args) => cmd_apollo(args),
     }
 }
 
@@ -417,4 +427,23 @@ fn default_firmware() -> Option<String> {
         .collect();
     bits.sort();
     bits.first().map(|p| p.to_string_lossy().into_owned())
+}
+
+fn cmd_apollo(args: ApolloArgs) -> Result<()> {
+    use usbmagic::flash::Apollo;
+
+    eprintln!("Connecting to Apollo (will hand off the USB port if gateware is running)...");
+    let apollo = Apollo::open().context("opening Apollo")?;
+
+    println!("ID:        {}", apollo.id()?);
+    println!("Firmware:  {}", apollo.firmware_version()?);
+    let (major, minor) = apollo.usb_api_version()?;
+    println!("USB API:   {major}.{minor}");
+
+    if args.reconfigure {
+        eprintln!("Reconfiguring FPGA from flash (restoring previous gateware)...");
+        apollo.reconfigure()?;
+        eprintln!("Done.");
+    }
+    Ok(())
 }

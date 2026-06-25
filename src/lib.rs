@@ -49,5 +49,8 @@ pub use pcapng::{
     parse_pcapng, parse_pd_pseudo_header, pd_pseudo_header, sop_name, PcapNg, PcapNgInterface,
     PcapNgPacket, PcapNgWriter, PdDirection, PdPseudoHeader, PdSop, LINKTYPE_USB_TYPE_C_PD,
 };
-pub use pd::{format_pd_message, pd_message_name, PdMessage, PdPort, PdTrace, PowerDelivery, Vdm};
+pub use pd::{
+    format_pd_message, pd_message_name, PdLink, PdMessage, PdPort, PdTrace, PowerDelivery,
+    VbusSource, Vdm,
+};
 pub use power::{MonitoredPort, PortPower, PowerMonitor};

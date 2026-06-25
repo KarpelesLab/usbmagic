@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
+pub mod link;
 pub mod trace;
+pub use link::{PdLink, VbusSource};
 pub use trace::{format_pd_message, pd_message_name, PdTrace};
 
 /// Which Type-C port's PD controller to address.

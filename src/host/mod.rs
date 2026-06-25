@@ -10,10 +10,39 @@
 //!
 //! The types here are transport-agnostic. A concrete implementation talks to the
 //! gateware over the CONTROL port (see `docs/PROTOCOL.md`); [`crate::mock`]
-//! provides a software implementation for development and tests.
+//! provides a software implementation for development and tests. See
+//! `docs/FORENSICS.md` for the full "normally not allowed" matrix.
+//!
+//! ```
+//! use usbmagic::{UsbHost, UsbForensics, host::descriptor_type};
+//! use usbmagic::mock::MockHost;
+//!
+//! let mut host = MockHost::new();
+//! host.set_vbus(true)?;
+//! let dev = host.enumerate()?;
+//!
+//! // Analyze: full descriptor/interface/string model.
+//! let model = host.examine(dev.address)?;
+//! assert_eq!(model.device_descriptor.vendor_id, 0x1209);
+//! assert_eq!(model.configurations[0].interfaces[0].endpoints.len(), 2);
+//!
+//! // Misbehave: ask for far more than the descriptor holds, see the short packet.
+//! let r = host.get_descriptor_oversized(dev.address, descriptor_type::DEVICE, 0, 4096)?;
+//! assert!(r.errors.iter().any(|e| matches!(e, usbmagic::BusError::ShortPacket)));
+//! # Ok::<(), usbmagic::Error>(())
+//! ```
 
 use crate::capture::Speed;
 use crate::error::{Error, Result};
+
+pub mod descriptors;
+pub mod forensics;
+
+pub use descriptors::{
+    Configuration, ConfigurationDescriptor, EndpointDescriptor, Interface, InterfaceDescriptor,
+    RawDescriptor, StringDescriptor, TransferType, UsbDeviceModel,
+};
+pub use forensics::UsbForensics;
 
 /// USB packet identifier (the 4-bit PID value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +209,38 @@ pub struct TxFlags {
     pub force_toggle: Option<bool>,
     /// The handshake the caller expects (recorded/asserted); `None` accepts any.
     pub expect: Option<Handshake>,
+    /// Corrupt the PID's check nibble (the high-nibble complement) — an illegal
+    /// packet a compliant host would never send.
+    pub bad_pid_check: bool,
+    /// Send a deliberately wrong token CRC5.
+    pub crc5_error: bool,
+    /// Send this exact data PID (DATA0/DATA1/DATA2/MDATA) regardless of the
+    /// tracked toggle — to provoke or study toggle handling.
+    pub force_data_pid: Option<Pid>,
+    /// Append this many extra junk bytes past the declared length (babble).
+    pub extra_bytes: usize,
+    /// Cut the data packet short (drop its trailing byte) — a short/runt packet.
+    pub truncate: bool,
+}
+
+/// Stage-level forensic controls for a [`control transfer`](UsbHost::control_raw),
+/// independent of the SETUP bytes themselves. Defaults are all compliant.
+///
+/// The SETUP packet (8 bytes) is passed separately and may itself be arbitrary
+/// (illegal `bmRequestType`, mismatched `wLength`, reserved requests…); these
+/// options control how the *stages* are driven around it.
+#[derive(Debug, Clone, Default)]
+pub struct ControlForensics {
+    /// Drive the data stage for exactly this many bytes instead of the SETUP's
+    /// `wLength` — to under/over-run on purpose (e.g. `wLength`=64 but read 0).
+    pub data_len_override: Option<usize>,
+    /// Skip the status stage entirely (a transfer with no handshake close).
+    pub skip_status: bool,
+    /// Drive the status stage in the wrong direction (IN where OUT is required,
+    /// or vice-versa).
+    pub status_wrong_dir: bool,
+    /// Per-transaction wire violations applied to the data stage.
+    pub flags: TxFlags,
 }
 
 /// A single low-level USB transaction (token + optional data + handshake).
@@ -369,16 +430,34 @@ pub trait UsbHost {
     /// Drive a USB bus reset; returns the speed detected afterwards.
     fn bus_reset(&mut self) -> Result<Option<Speed>>;
 
-    /// Perform a full control transfer to the device at `address`.
+    /// Perform a control transfer from **raw SETUP bytes** with stage-level
+    /// forensic control — the low-level control primitive.
+    ///
+    /// `setup` is the 8 SETUP bytes exactly as they go on the wire (any value,
+    /// including illegal `bmRequestType` / mismatched `wLength`). `opts` controls
+    /// the data and status stages (see [`ControlForensics`]). For a compliant
+    /// transfer, prefer [`control_transfer`](UsbHost::control_transfer).
+    fn control_raw(
+        &mut self,
+        address: u8,
+        setup: [u8; 8],
+        data_out: &[u8],
+        opts: ControlForensics,
+    ) -> Result<ControlResult>;
+
+    /// Perform a full, compliant control transfer to the device at `address`.
     ///
     /// For IN transfers `data_out` is ignored and the returned [`ControlResult::data`]
     /// holds the device's response; for OUT transfers `data_out` is the payload.
+    /// Defaults to [`control_raw`](UsbHost::control_raw) with compliant options.
     fn control_transfer(
         &mut self,
         address: u8,
         setup: Setup,
         data_out: &[u8],
-    ) -> Result<ControlResult>;
+    ) -> Result<ControlResult> {
+        self.control_raw(address, setup.to_bytes(), data_out, ControlForensics::default())
+    }
 
     /// Perform a bulk or interrupt transfer on `endpoint`.
     fn transfer(
@@ -462,6 +541,122 @@ pub trait UsbHost {
             speed,
             device_descriptor: DeviceDescriptor::parse(&full.data)?,
             raw_device_descriptor: full.data,
+        })
+    }
+
+    /// `GET_DESCRIPTOR` for an arbitrary descriptor type/index/language, asking
+    /// for `len` bytes. Returns the raw bytes the device sent (which may be
+    /// shorter, or — forensically — longer if you asked for more than exists).
+    fn get_descriptor(
+        &mut self,
+        address: u8,
+        desc_type: u8,
+        index: u8,
+        lang: u16,
+        len: u16,
+    ) -> Result<Vec<u8>> {
+        let r = self.control_transfer(
+            address,
+            Setup {
+                request_type: 0x80,
+                request: request::GET_DESCRIPTOR,
+                value: (u16::from(desc_type) << 8) | u16::from(index),
+                index: lang,
+                length: len,
+            },
+            &[],
+        )?;
+        Ok(r.data)
+    }
+
+    /// Read and decode a string descriptor at `index` in `lang` (UTF-16LE).
+    /// `index` 0 conventionally returns the LANGID list; this decodes it as text
+    /// anyway (use [`descriptors::StringDescriptor::parse_langids`] for langids).
+    fn get_string(&mut self, address: u8, index: u8, lang: u16) -> Result<String> {
+        let raw = self.get_descriptor(address, descriptor_type::STRING, index, lang, 255)?;
+        Ok(descriptors::StringDescriptor::decode(&raw))
+    }
+
+    /// Read configuration `cfg_index` in full (9-byte header to learn
+    /// `wTotalLength`, then the whole blob) and parse it into a [`Configuration`].
+    fn read_configuration(&mut self, address: u8, cfg_index: u8) -> Result<Configuration> {
+        let head = self.get_descriptor(address, descriptor_type::CONFIGURATION, cfg_index, 0, 9)?;
+        let total = ConfigurationDescriptor::parse(&head)
+            .map(|c| c.total_length)
+            .unwrap_or(head.len() as u16);
+        let blob = self.get_descriptor(
+            address,
+            descriptor_type::CONFIGURATION,
+            cfg_index,
+            0,
+            total,
+        )?;
+        Configuration::parse(&blob)
+            .ok_or_else(|| Error::Protocol("configuration descriptor too short".into()))
+    }
+
+    /// **Analyze** the device at `address`: read the device descriptor, every
+    /// configuration, and the referenced string descriptors into a
+    /// [`UsbDeviceModel`]. Lenient — oddities are collected in
+    /// [`UsbDeviceModel::anomalies`] instead of aborting.
+    fn examine(&mut self, address: u8) -> Result<UsbDeviceModel> {
+        let mut anomalies = Vec::new();
+        let raw_dd = self.get_descriptor(address, descriptor_type::DEVICE, 0, 0, 18)?;
+        if raw_dd.len() < 18 {
+            anomalies.push(format!("device descriptor was {} bytes (<18)", raw_dd.len()));
+        }
+        let device_descriptor = DeviceDescriptor::parse(&raw_dd)?;
+        let speed = self.port_status().ok().and_then(|p| p.speed);
+
+        // Pick a language for strings: first LANGID, else en-US.
+        let langids = descriptors::StringDescriptor::parse_langids(
+            &self
+                .get_descriptor(address, descriptor_type::STRING, 0, 0, 255)
+                .unwrap_or_default(),
+        );
+        let lang = langids.first().copied().unwrap_or(0x0409);
+
+        let mut configurations = Vec::new();
+        for cfg in 0..device_descriptor.num_configurations {
+            match self.read_configuration(address, cfg) {
+                Ok(c) => configurations.push(c),
+                Err(e) => anomalies.push(format!("configuration {cfg}: {e}")),
+            }
+        }
+
+        // Collect string indices referenced by the descriptors.
+        let mut strings = std::collections::BTreeMap::new();
+        let mut want: Vec<u8> = vec![
+            device_descriptor.manufacturer_index,
+            device_descriptor.product_index,
+            device_descriptor.serial_index,
+        ];
+        for c in &configurations {
+            want.push(c.descriptor.configuration_index);
+            for i in &c.interfaces {
+                want.push(i.descriptor.interface_index);
+            }
+        }
+        want.retain(|&i| i != 0);
+        want.sort_unstable();
+        want.dedup();
+        for idx in want {
+            match self.get_string(address, idx, lang) {
+                Ok(s) => {
+                    strings.insert((idx, lang), s);
+                }
+                Err(e) => anomalies.push(format!("string {idx}: {e}")),
+            }
+        }
+
+        Ok(UsbDeviceModel {
+            address,
+            speed,
+            device_descriptor,
+            raw_device_descriptor: raw_dd,
+            configurations,
+            strings,
+            anomalies,
         })
     }
 }

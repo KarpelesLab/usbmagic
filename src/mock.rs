@@ -5,13 +5,14 @@
 //! answers the standard enumeration sequence, so [`UsbHost::enumerate`] works
 //! end-to-end against it.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::capture::Speed;
 use crate::error::Result;
 use crate::host::{
-    descriptor_type, request, BusError, ControlResult, Direction, Handshake, PortStatus, RawTransaction,
-    Setup, TransactionResult, UsbHost, WireEvent, WireEventKind,
+    descriptor_type, request, BusError, ControlForensics, ControlResult, Direction, Handshake, Pid,
+    PortStatus, RawTransaction, Setup, TransactionResult, UsbHost, WireEvent, WireEventKind,
 };
 use crate::pd::{CcOrientation, CcStatus, PdMessage, PdPort, PowerDelivery};
 use crate::power::{MonitoredPort, PortPower, PowerMonitor};
@@ -21,13 +22,16 @@ use crate::power::{MonitoredPort, PortPower, PowerMonitor};
 pub struct VirtualDevice {
     pub device_descriptor: [u8; 18],
     pub config_descriptor: Vec<u8>,
+    /// String descriptors keyed by `(index, langid)`.
+    pub strings: BTreeMap<(u8, u16), String>,
     pub speed: Speed,
     /// Current device address (0 until SET_ADDRESS).
     pub address: u8,
 }
 
 impl VirtualDevice {
-    /// A plain full-speed device with VID `0x1209` / PID `0x0001`.
+    /// A full-speed device (VID `0x1209` / PID `0x0001`) with one vendor-class
+    /// interface (two bulk endpoints) and a few string descriptors.
     pub fn example() -> VirtualDevice {
         let mut dd = [0u8; 18];
         dd[0] = 18; // bLength
@@ -41,17 +45,63 @@ impl VirtualDevice {
         dd[11] = 0x00; // idProduct 0x0001
         dd[12] = 0x00;
         dd[13] = 0x01; // bcdDevice 1.00
+        dd[14] = 1; // iManufacturer
+        dd[15] = 2; // iProduct
+        dd[16] = 3; // iSerialNumber
         dd[17] = 1; // bNumConfigurations
 
-        // Minimal 9-byte configuration descriptor (no interfaces, for the mock).
-        let config = vec![9, descriptor_type::CONFIGURATION, 9, 0, 1, 1, 0, 0x80, 50];
+        // Config (str 5) + one vendor interface (str 4) + two bulk endpoints.
+        let mut config = vec![
+            9, descriptor_type::CONFIGURATION, 0, 0, 1, 1, 5, 0xC0, 50, //
+            9, descriptor_type::INTERFACE, 0, 0, 2, 0xFF, 0x00, 0x00, 4, //
+            7, descriptor_type::ENDPOINT, 0x81, 0x02, 0x40, 0x00, 0x00, //
+            7, descriptor_type::ENDPOINT, 0x01, 0x02, 0x40, 0x00, 0x00, //
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+
+        let mut strings = BTreeMap::new();
+        for (idx, s) in [
+            (1u8, "usbmagic"),
+            (2, "Mock Device"),
+            (3, "SN-0001"),
+            (4, "Default Interface"),
+            (5, "Config 1"),
+        ] {
+            strings.insert((idx, 0x0409u16), s.to_string());
+        }
 
         VirtualDevice {
             device_descriptor: dd,
             config_descriptor: config,
+            strings,
             speed: Speed::Full,
             address: 0,
         }
+    }
+
+    /// Build the on-wire bytes of string descriptor `index` in `langid`, or
+    /// `None` if the device has no such string (→ the device STALLs).
+    fn string_descriptor(&self, index: u8, langid: u16) -> Option<Vec<u8>> {
+        let mut d = vec![0u8, descriptor_type::STRING];
+        if index == 0 {
+            // LANGID list (string index 0).
+            let mut langs: Vec<u16> = self.strings.keys().map(|k| k.1).collect();
+            langs.sort_unstable();
+            langs.dedup();
+            if langs.is_empty() {
+                langs.push(0x0409);
+            }
+            for l in langs {
+                d.extend_from_slice(&l.to_le_bytes());
+            }
+        } else {
+            for u in self.strings.get(&(index, langid))?.encode_utf16() {
+                d.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        d[0] = d.len() as u8;
+        Some(d)
     }
 }
 
@@ -132,13 +182,25 @@ impl UsbHost for MockHost {
         Ok(self.vbus.then_some(self.device.speed))
     }
 
-    fn control_transfer(
+    fn control_raw(
         &mut self,
         address: u8,
-        setup: Setup,
+        setup_bytes: [u8; 8],
         _data_out: &[u8],
+        opts: ControlForensics,
     ) -> Result<ControlResult> {
         let start = self.tick(50_000);
+        let setup = Setup {
+            request_type: setup_bytes[0],
+            request: setup_bytes[1],
+            value: u16::from_le_bytes([setup_bytes[2], setup_bytes[3]]),
+            index: u16::from_le_bytes([setup_bytes[4], setup_bytes[5]]),
+            length: u16::from_le_bytes([setup_bytes[6], setup_bytes[7]]),
+        };
+        self.log(WireEventKind::Packet {
+            pid: Pid::Setup,
+            data: setup_bytes.to_vec(),
+        });
 
         // No device answers at an address other than its current one.
         if address != self.device.address {
@@ -151,19 +213,30 @@ impl UsbHost for MockHost {
             });
         }
 
-        let (data, stalled): (Vec<u8>, bool) = match setup.request {
+        let mut errors = Vec::new();
+        // How many data bytes the host actually clocks (forensic override).
+        let stage_len = opts.data_len_override.unwrap_or(setup.length as usize);
+
+        let (mut data, stalled): (Vec<u8>, bool) = match setup.request {
             request::GET_DESCRIPTOR => {
                 let desc_type = (setup.value >> 8) as u8;
-                let want = setup.length as usize;
-                match desc_type {
-                    descriptor_type::DEVICE => {
-                        (self.device.device_descriptor[..want.min(18)].to_vec(), false)
+                let index = (setup.value & 0xFF) as u8;
+                let full: Option<Vec<u8>> = match desc_type {
+                    descriptor_type::DEVICE => Some(self.device.device_descriptor.to_vec()),
+                    descriptor_type::CONFIGURATION => Some(self.device.config_descriptor.clone()),
+                    descriptor_type::STRING => self.device.string_descriptor(index, setup.index),
+                    _ => None,
+                };
+                match full {
+                    Some(bytes) => {
+                        // The device returns at most what it has; asking for more
+                        // (oversized) yields a short packet, not extra data.
+                        if stage_len > bytes.len() {
+                            errors.push(BusError::ShortPacket);
+                        }
+                        (bytes[..stage_len.min(bytes.len())].to_vec(), false)
                     }
-                    descriptor_type::CONFIGURATION => {
-                        let n = want.min(self.device.config_descriptor.len());
-                        (self.device.config_descriptor[..n].to_vec(), false)
-                    }
-                    _ => (Vec::new(), true),
+                    None => (Vec::new(), true), // unknown/missing descriptor → STALL
                 }
             }
             request::SET_ADDRESS => {
@@ -171,13 +244,32 @@ impl UsbHost for MockHost {
                 (Vec::new(), false)
             }
             request::SET_CONFIGURATION => (Vec::new(), false),
-            _ => (Vec::new(), true),
+            _ => (Vec::new(), true), // unsupported request → STALL
         };
+
+        // Reflect data-stage wire violations.
+        if opts.flags.truncate && !data.is_empty() {
+            data.pop();
+            errors.push(BusError::ShortPacket);
+        }
+        if opts.flags.extra_bytes > 0 {
+            data.extend(std::iter::repeat(0xCD).take(opts.flags.extra_bytes));
+            errors.push(BusError::Babble);
+        }
+        if opts.flags.corrupt_crc {
+            errors.push(BusError::Crc16);
+        }
+        if opts.skip_status {
+            errors.push(BusError::Other("control transfer had no status stage".into()));
+        }
+        if opts.status_wrong_dir {
+            errors.push(BusError::Other("status stage driven in the wrong direction".into()));
+        }
 
         Ok(ControlResult {
             data,
             stalled,
-            errors: Vec::new(),
+            errors,
             duration_ns: self.clock_ns - start,
         })
     }
@@ -221,6 +313,18 @@ impl UsbHost for MockHost {
         let mut errors = Vec::new();
         if tx.flags.corrupt_crc {
             errors.push(BusError::Crc16);
+        }
+        if tx.flags.bad_pid_check {
+            errors.push(BusError::PidCheck);
+        }
+        if tx.flags.crc5_error {
+            errors.push(BusError::Crc5);
+        }
+        if tx.flags.extra_bytes > 0 {
+            errors.push(BusError::Babble);
+        }
+        if tx.flags.truncate {
+            errors.push(BusError::ShortPacket);
         }
         let handshake = if tx.address == self.device.address {
             Handshake::Ack
@@ -353,5 +457,78 @@ mod tests {
         let p = host.read(MonitoredPort::TargetC).unwrap();
         assert_eq!(p.voltage_mv, 5000);
         assert_eq!(p.current_ma, 100);
+    }
+
+    #[test]
+    fn examine_builds_full_model() {
+        let mut host = MockHost::new();
+        host.set_vbus(true).unwrap();
+        let dev = host.enumerate().unwrap();
+        let model = host.examine(dev.address).unwrap();
+        assert_eq!(model.device_descriptor.vendor_id, 0x1209);
+        assert_eq!(model.configurations.len(), 1);
+        let iface = &model.configurations[0].interfaces[0];
+        assert_eq!(iface.descriptor.class, 0xFF);
+        assert_eq!(iface.endpoints.len(), 2);
+        assert_eq!(model.strings.get(&(1, 0x0409)).map(String::as_str), Some("usbmagic"));
+        assert_eq!(model.strings.get(&(2, 0x0409)).map(String::as_str), Some("Mock Device"));
+        assert!(model.anomalies.is_empty());
+    }
+
+    #[test]
+    fn forensic_oversized_descriptor_reports_short_packet() {
+        use crate::host::UsbForensics;
+        let mut host = MockHost::new();
+        host.set_vbus(true).unwrap();
+        host.enumerate().unwrap();
+        // Ask for 4096 bytes of an 18-byte descriptor.
+        let r = host
+            .get_descriptor_oversized(1, descriptor_type::DEVICE, 0, 4096)
+            .unwrap();
+        assert_eq!(r.data.len(), 18); // device only has 18
+        assert!(r.errors.contains(&BusError::ShortPacket));
+    }
+
+    #[test]
+    fn forensic_babble_and_unassigned_and_bad_pid() {
+        use crate::host::UsbForensics;
+        let mut host = MockHost::new();
+        host.set_vbus(true).unwrap();
+        host.enumerate().unwrap();
+
+        let r = host.babble(1, 1, &[0xAA], 16).unwrap();
+        assert!(r.errors.contains(&BusError::Babble));
+
+        // Nobody answers at address 9.
+        let r = host.talk_to_unassigned(9, 1).unwrap();
+        assert!(r.errors.contains(&BusError::Timeout));
+        assert_eq!(r.handshake, Handshake::None);
+
+        let r = host.bad_pid(1, 0, Pid::Out).unwrap();
+        assert!(r.errors.contains(&BusError::PidCheck));
+    }
+
+    #[test]
+    fn forensic_setup_length_mismatch_and_skip_status() {
+        use crate::host::UsbForensics;
+        let mut host = MockHost::new();
+        host.set_vbus(true).unwrap();
+        host.enumerate().unwrap();
+        // GET_DESCRIPTOR(device) claiming wLength=18 but only clocking 4 bytes.
+        let setup = Setup {
+            request_type: 0x80,
+            request: request::GET_DESCRIPTOR,
+            value: (u16::from(descriptor_type::DEVICE)) << 8,
+            index: 0,
+            length: 18,
+        };
+        let r = host.setup_length_mismatch(1, setup.to_bytes(), &[], 4).unwrap();
+        assert_eq!(r.data.len(), 4); // honored the override, not wLength
+
+        let r = host.control_without_status(1, setup.to_bytes(), &[]).unwrap();
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| matches!(e, BusError::Other(s) if s.contains("status"))));
     }
 }

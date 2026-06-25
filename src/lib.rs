@@ -43,7 +43,11 @@ pub use capture::{CaptureData, CaptureItem, CaptureOptions, CaptureStream, Speed
 pub use device::{discover, Capabilities, DeviceDescription, Discovered, MagicDevice, State};
 pub use error::{Error, Result};
 pub use host::{
-    DeviceDescriptor, Direction, EnumeratedDevice, Handshake, Pid, RawTransaction, Setup, UsbHost,
+    BusError, Configuration, ConfigurationDescriptor, ControlForensics, ControlResult,
+    DeviceDescriptor, Direction, EndpointDescriptor, EnumeratedDevice, Handshake, Interface,
+    InterfaceDescriptor, Pid, PortStatus, RawDescriptor, RawTransaction, Setup, StringDescriptor,
+    TransactionResult, TransferType, TxFlags, UsbDeviceModel, UsbForensics, UsbHost, WireEvent,
+    WireEventKind,
 };
 pub use pcapng::{
     parse_pcapng, parse_pd_pseudo_header, pd_pseudo_header, sop_name, PcapNg, PcapNgInterface,

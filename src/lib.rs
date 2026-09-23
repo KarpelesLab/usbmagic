@@ -38,6 +38,7 @@ pub mod pcap;
 pub mod pcapng;
 pub mod pd;
 pub mod power;
+mod usb;
 
 pub use capture::{CaptureData, CaptureItem, CaptureOptions, CaptureStream, Speed, StopFn};
 pub use device::{discover, Capabilities, DeviceDescription, Discovered, MagicDevice, State};

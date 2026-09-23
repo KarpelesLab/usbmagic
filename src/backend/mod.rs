@@ -12,10 +12,10 @@ pub trait Backend: Sync {
     fn name(&self) -> &'static str;
 
     /// Whether this backend can handle the given USB device.
-    fn matches(&self, info: &nusb::DeviceInfo) -> bool;
+    fn matches(&self, dev: &rawusb::Device) -> bool;
 
     /// Open the device and return a controllable handle.
-    fn open(&self, info: nusb::DeviceInfo) -> Result<Box<dyn MagicDevice>>;
+    fn open(&self, dev: rawusb::Device) -> Result<Box<dyn MagicDevice>>;
 }
 
 /// All backends, tried in order during discovery.

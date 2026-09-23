@@ -3,8 +3,7 @@
 use crate::backend::{self, Backend};
 use crate::capture::{CaptureOptions, CaptureStream, Speed};
 use crate::error::Result;
-
-use nusb::MaybeFuture;
+use crate::usb;
 
 /// Stable identity of a device, available without opening it.
 #[derive(Debug, Clone)]
@@ -15,7 +14,7 @@ pub struct DeviceDescription {
     pub vendor_id: u16,
     /// USB product ID.
     pub product_id: u16,
-    /// Product string, if the OS has it cached.
+    /// Product string, if the device has one and it could be read.
     pub product: Option<String>,
     /// Serial number, if present.
     pub serial: Option<String>,
@@ -92,7 +91,7 @@ pub trait MagicDevice {
 /// A device found on the bus that a backend can open.
 pub struct Discovered {
     description: DeviceDescription,
-    info: nusb::DeviceInfo,
+    device: rawusb::Device,
     backend: &'static dyn Backend,
 }
 
@@ -104,32 +103,35 @@ impl Discovered {
 
     /// Open the device, returning a controllable handle.
     pub fn open(self) -> Result<Box<dyn MagicDevice>> {
-        self.backend.open(self.info)
+        self.backend.open(self.device)
     }
 }
 
-/// Build a [`DeviceDescription`] from raw USB info and a backend name.
-pub(crate) fn describe(backend: &'static str, info: &nusb::DeviceInfo) -> DeviceDescription {
+/// Build a [`DeviceDescription`] from a USB device and a backend name.
+///
+/// The product and serial strings are read from the device, best-effort.
+pub(crate) fn describe(backend: &'static str, dev: &rawusb::Device) -> DeviceDescription {
+    let (product, serial) = usb::strings(dev);
     DeviceDescription {
         backend,
-        vendor_id: info.vendor_id(),
-        product_id: info.product_id(),
-        product: info.product_string().map(str::to_string),
-        serial: info.serial_number().map(str::to_string),
-        bus_id: info.bus_id().to_string(),
-        address: info.device_address(),
+        vendor_id: dev.vendor_id(),
+        product_id: dev.product_id(),
+        product,
+        serial,
+        bus_id: dev.bus_number().to_string(),
+        address: dev.address(),
     }
 }
 
 /// Enumerate all connected magic USB devices across all backends.
 pub fn discover() -> Result<Vec<Discovered>> {
     let mut found = Vec::new();
-    for info in nusb::list_devices().wait()? {
+    for device in usb::devices()? {
         for backend in backend::BACKENDS {
-            if backend.matches(&info) {
+            if backend.matches(&device) {
                 found.push(Discovered {
-                    description: describe(backend.name(), &info),
-                    info,
+                    description: describe(backend.name(), &device),
+                    device,
                     backend: *backend,
                 });
                 break;

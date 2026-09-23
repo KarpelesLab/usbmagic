@@ -7,7 +7,7 @@ Scott Gadgets running the *USB Analyzer* gateware (USB ID `1d50:615b`), which
 passively captures Low/Full/High-speed USB 2.0 traffic flowing through its
 TARGET ports.
 
-Built on [`nusb`](https://docs.rs/nusb) (pure-Rust USB, no libusb).
+Built on [`rawusb`](https://docs.rs/rawusb) (dependency-free, cross-platform USB, no libusb).
 
 ## Install / build
 

@@ -8,13 +8,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Errors produced while discovering, controlling, or capturing from a device.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// A USB operation (open, claim, configure) failed.
+    /// A USB operation (enumerate, open, claim, transfer) failed.
     #[error("USB error: {0}")]
-    Usb(#[from] nusb::Error),
-
-    /// A USB control or bulk transfer failed.
-    #[error("USB transfer error: {0}")]
-    Transfer(#[from] nusb::transfer::TransferError),
+    Usb(#[from] rawusb::Error),
 
     /// An I/O error, e.g. while reading the capture stream or writing output.
     #[error("I/O error: {0}")]

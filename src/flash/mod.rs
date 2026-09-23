@@ -20,10 +20,10 @@
 
 use std::time::Duration;
 
-use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
-use nusb::MaybeFuture;
+use rawusb::{DeviceHandle, Recipient};
 
 use crate::error::{Error, Result};
+use crate::usb;
 
 /// JTAG IDCODE of the Cynthion's ECP5 (LFE5U-12F).
 pub const ECP5_12F_IDCODE: u32 = 0x2111_1043;
@@ -134,8 +134,8 @@ pub fn detect() -> Result<BoardMode> {
 /// Find the first attached Cynthion (Apollo mode preferred over running gateware).
 pub fn find() -> Result<Option<ApolloDevice>> {
     let mut gateware: Option<ApolloDevice> = None;
-    for info in nusb::list_devices().wait()? {
-        let (vid, pid) = (info.vendor_id(), info.product_id());
+    for dev in usb::devices()? {
+        let (vid, pid) = (dev.vendor_id(), dev.product_id());
         let mode = if is_apollo(vid, pid) {
             BoardMode::Apollo
         } else if vid == VID && pid == PID_GATEWARE {
@@ -145,9 +145,9 @@ pub fn find() -> Result<Option<ApolloDevice>> {
         };
         let dev = ApolloDevice {
             mode,
-            serial: info.serial_number().map(str::to_string),
-            bus_id: info.bus_id().to_string(),
-            address: info.device_address(),
+            serial: usb::strings(&dev).1,
+            bus_id: dev.bus_number().to_string(),
+            address: dev.address(),
         };
         match mode {
             BoardMode::Apollo => return Ok(Some(dev)),
@@ -160,8 +160,7 @@ pub fn find() -> Result<Option<ApolloDevice>> {
 
 /// A live connection to an Apollo debugger.
 pub struct Apollo {
-    _device: nusb::Device,
-    interface: nusb::Interface,
+    handle: DeviceHandle,
 }
 
 impl Apollo {
@@ -182,8 +181,8 @@ impl Apollo {
         // permissions, which surfaces as a transient permission error.
         let mut last_err = None;
         for _ in 0..60 {
-            if let Some(info) = find_apollo_info()? {
-                match Apollo::from_info(&info) {
+            if let Some(dev) = find_apollo_info()? {
+                match Apollo::from_device(&dev) {
                     Ok(apollo) => return Ok(apollo),
                     Err(e) => last_err = Some(e),
                 }
@@ -195,41 +194,23 @@ impl Apollo {
         }))
     }
 
-    fn from_info(info: &nusb::DeviceInfo) -> Result<Apollo> {
-        let device = info.open().wait()?;
+    fn from_device(dev: &rawusb::Device) -> Result<Apollo> {
         // EP0 device-recipient control transfers work through any claimed
         // interface, but Apollo's interfaces 0/1 are CDC-ACM and held by the
         // kernel `cdc_acm` driver. Claim a non-CDC interface (the DFU/vendor one)
         // to avoid an "interface busy" error.
-        let iface_num = info
-            .interfaces()
-            .map(|f| (f.interface_number(), f.class()))
-            .filter(|(_, class)| !matches!(class, 0x02 | 0x0a))
-            .map(|(n, _)| n)
+        let iface_num = usb::interfaces(dev)
+            .into_iter()
+            .filter(|f| !matches!(f.class, 0x02 | 0x0a))
+            .map(|f| f.number)
             .min()
             .unwrap_or(0);
-        let interface = device.claim_interface(iface_num).wait()?;
-        Ok(Apollo {
-            _device: device,
-            interface,
-        })
+        let handle = usb::open_claim(dev, iface_num)?;
+        Ok(Apollo { handle })
     }
 
     fn read_string(&self, request: u8) -> Result<String> {
-        let data = self
-            .interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request,
-                    value: 0,
-                    index: 0,
-                    length: 256,
-                },
-                TIMEOUT,
-            )
-            .wait()?;
+        let data = usb::vendor_in(&self.handle, Recipient::Device, request, 0, 0, 256, TIMEOUT)?;
         let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         Ok(String::from_utf8_lossy(&data[..end]).into_owned())
     }
@@ -246,20 +227,15 @@ impl Apollo {
 
     /// The Apollo USB API version as `(major, minor)`.
     pub fn usb_api_version(&self) -> Result<(u8, u8)> {
-        let data = self
-            .interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request: REQUEST_GET_USB_API_VERSION,
-                    value: 0,
-                    index: 0,
-                    length: 2,
-                },
-                TIMEOUT,
-            )
-            .wait()?;
+        let data = usb::vendor_in(
+            &self.handle,
+            Recipient::Device,
+            REQUEST_GET_USB_API_VERSION,
+            0,
+            0,
+            2,
+            TIMEOUT,
+        )?;
         if data.len() < 2 {
             return Err(Error::Protocol("short USB API version response".into()));
         }
@@ -268,38 +244,28 @@ impl Apollo {
 
     /// Low-level Apollo vendor OUT request (recipient = device).
     fn out_req(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request,
-                    value,
-                    index,
-                    data,
-                },
-                TIMEOUT,
-            )
-            .wait()?;
-        Ok(())
+        usb::vendor_out(
+            &self.handle,
+            Recipient::Device,
+            request,
+            value,
+            index,
+            data,
+            TIMEOUT,
+        )
     }
 
     /// Low-level Apollo vendor IN request (recipient = device).
     fn in_req(&self, request: u8, value: u16, index: u16, length: u16) -> Result<Vec<u8>> {
-        Ok(self
-            .interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request,
-                    value,
-                    index,
-                    length,
-                },
-                TIMEOUT,
-            )
-            .wait()?)
+        usb::vendor_in(
+            &self.handle,
+            Recipient::Device,
+            request,
+            value,
+            index,
+            length,
+            TIMEOUT,
+        )
     }
 
     /// Read the JTAG IDCODE of the attached FPGA.
@@ -841,20 +807,15 @@ impl Apollo {
     /// Trigger Apollo to reconfigure the FPGA from its SPI flash (restores the
     /// previously-flashed gateware, e.g. the analyzer).
     pub fn reconfigure(&self) -> Result<()> {
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request: REQUEST_RECONFIGURE,
-                    value: 0,
-                    index: 0,
-                    data: &[],
-                },
-                TIMEOUT,
-            )
-            .wait()?;
-        Ok(())
+        usb::vendor_out(
+            &self.handle,
+            Recipient::Device,
+            REQUEST_RECONFIGURE,
+            0,
+            0,
+            &[],
+            TIMEOUT,
+        )
     }
 }
 
@@ -1111,47 +1072,38 @@ impl<'a> I2cBus<'a> {
     }
 }
 
-fn find_apollo_info() -> Result<Option<nusb::DeviceInfo>> {
-    Ok(nusb::list_devices()
-        .wait()?
-        .find(|i| is_apollo(i.vendor_id(), i.product_id())))
+fn find_apollo_info() -> Result<Option<rawusb::Device>> {
+    Ok(usb::devices()?
+        .into_iter()
+        .find(|d| is_apollo(d.vendor_id(), d.product_id())))
 }
 
-fn find_stub_info() -> Result<Option<nusb::DeviceInfo>> {
-    Ok(nusb::list_devices().wait()?.find(|i| {
-        i.vendor_id() == VID
-            && i.product_id() == PID_GATEWARE
-            && i.interfaces()
-                .any(|f| f.class() == STUB_CLASS && f.subclass() == STUB_SUBCLASS)
+fn find_stub_info() -> Result<Option<rawusb::Device>> {
+    Ok(usb::devices()?.into_iter().find(|d| {
+        d.vendor_id() == VID
+            && d.product_id() == PID_GATEWARE
+            && usb::find_interface(d, STUB_CLASS, STUB_SUBCLASS).is_some()
     }))
 }
 
 /// Ask running gateware to release the shared USB port to Apollo.
-fn request_handoff(info: &nusb::DeviceInfo) -> Result<()> {
-    let stub_iface = info
-        .interfaces()
-        .find(|f| f.class() == STUB_CLASS && f.subclass() == STUB_SUBCLASS)
-        .map(|f| f.interface_number())
+fn request_handoff(dev: &rawusb::Device) -> Result<()> {
+    let stub_iface = usb::find_interface(dev, STUB_CLASS, STUB_SUBCLASS)
         .ok_or(Error::Unsupported("no Apollo stub interface on device"))?;
 
-    let device = info.open().wait()?;
-    let interface = device.claim_interface(stub_iface).wait()?;
+    let interface = usb::open_claim(dev, stub_iface)?;
     // Recipient = interface; index carries the interface number. The device
     // disconnects and re-enumerates as Apollo, so a transfer error here is
     // expected and ignored.
-    let _ = interface
-        .control_out(
-            ControlOut {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Interface,
-                request: REQUEST_APOLLO_ADV_STOP,
-                value: 0,
-                index: u16::from(stub_iface),
-                data: &[],
-            },
-            TIMEOUT,
-        )
-        .wait();
+    let _ = usb::vendor_out(
+        &interface,
+        Recipient::Interface,
+        REQUEST_APOLLO_ADV_STOP,
+        0,
+        u16::from(stub_iface),
+        &[],
+        TIMEOUT,
+    );
     Ok(())
 }
 

@@ -13,13 +13,12 @@
 //! BSD-3-Clause, Copyright (c) 2022-2024 Great Scott Gadgets. See the project
 //! `LICENSE` file; the original copyright is retained as required.
 
-use std::io::Read;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
-use nusb::{Interface, MaybeFuture};
+use rawusb::{DeviceHandle, Recipient, Transfer, TransferStatus};
 
 use crate::backend::Backend;
 use crate::capture::{
@@ -27,6 +26,7 @@ use crate::capture::{
 };
 use crate::device::{describe, Capabilities, DeviceDescription, MagicDevice, State};
 use crate::error::{Error, Result};
+use crate::usb;
 
 const VID: u16 = 0x1d50;
 const PID: u16 = 0x615b;
@@ -38,6 +38,8 @@ const SUBCLASS: u8 = 0x10;
 const ENDPOINT: u8 = 0x81;
 /// Size of each bulk read.
 const READ_LEN: usize = 0x4000;
+/// Bulk reads kept in flight so the endpoint is always being serviced.
+const READ_QUEUE: usize = 4;
 /// Control transfer timeout.
 const TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a capture read blocks before returning so we can check for a stop
@@ -62,24 +64,18 @@ impl Backend for Cynthion {
         "cynthion"
     }
 
-    fn matches(&self, info: &nusb::DeviceInfo) -> bool {
-        info.vendor_id() == VID
-            && info.product_id() == PID
-            && info
-                .interfaces()
-                .any(|i| i.class() == CLASS && i.subclass() == SUBCLASS)
+    fn matches(&self, dev: &rawusb::Device) -> bool {
+        dev.vendor_id() == VID
+            && dev.product_id() == PID
+            && usb::find_interface(dev, CLASS, SUBCLASS).is_some()
     }
 
-    fn open(&self, info: nusb::DeviceInfo) -> Result<Box<dyn MagicDevice>> {
-        let iface_num = info
-            .interfaces()
-            .find(|i| i.class() == CLASS && i.subclass() == SUBCLASS)
-            .map(|i| i.interface_number())
+    fn open(&self, dev: rawusb::Device) -> Result<Box<dyn MagicDevice>> {
+        let iface_num = usb::find_interface(&dev, CLASS, SUBCLASS)
             .ok_or(Error::Unsupported("no analyzer interface on device"))?;
 
-        let description = describe(self.name(), &info);
-        let device = info.open().wait()?;
-        let interface = device.claim_interface(iface_num).wait()?;
+        let description = describe(self.name(), &dev);
+        let interface = usb::open_claim(&dev, iface_num)?;
 
         let speeds_byte = read_register(&interface, iface_num, REQ_GET_SPEEDS)?;
         let protocol_version = read_register(&interface, iface_num, REQ_GET_VERSION).ok();
@@ -103,7 +99,7 @@ impl Backend for Cynthion {
 struct CynthionDevice {
     description: DeviceDescription,
     capabilities: Capabilities,
-    interface: Interface,
+    interface: DeviceHandle,
     iface_num: u8,
 }
 
@@ -133,20 +129,20 @@ impl MagicDevice for CynthionDevice {
         write_state(&self.interface, self.iface_num, stop_state)?;
         write_state(&self.interface, self.iface_num, run_state)?;
 
-        let reader = self
-            .interface
-            .endpoint::<Bulk, In>(ENDPOINT)?
-            .reader(READ_LEN)
-            .with_read_timeout(READ_TIMEOUT);
+        let mut reads = VecDeque::with_capacity(READ_QUEUE);
+        for _ in 0..READ_QUEUE {
+            let transfer = Transfer::bulk(&self.interface, ENDPOINT, vec![0u8; READ_LEN]);
+            transfer.submit()?;
+            reads.push_back(transfer);
+        }
 
         Ok(CaptureStream::new(Box::new(CynthionCapture {
-            reader: Box::new(reader),
+            reads,
             interface: self.interface.clone(),
             iface_num: self.iface_num,
             stop_state,
             stop: Arc::new(AtomicBool::new(false)),
             parser: RecordParser::new(),
-            scratch: vec![0u8; READ_LEN],
             done: false,
             stopped: false,
         })))
@@ -220,18 +216,17 @@ impl RecordParser {
     }
 }
 
-/// Active capture: pulls bytes from the bulk reader and decodes records.
+/// Active capture: pulls bytes from queued bulk reads and decodes records.
 struct CynthionCapture {
-    reader: Box<dyn Read + Send>,
-    interface: Interface,
+    /// In-flight bulk IN transfers, in submission (= completion) order.
+    reads: VecDeque<Transfer>,
+    interface: DeviceHandle,
     iface_num: u8,
     /// State byte to write to disable capture.
     stop_state: u8,
     /// Shared flag: set to request the capture loop to end at the next read tick.
     stop: Arc<AtomicBool>,
     parser: RecordParser,
-    /// Reusable read buffer.
-    scratch: Vec<u8>,
     /// Stream has ended (EOF or error).
     done: bool,
     /// Capture has been disabled.
@@ -250,33 +245,56 @@ impl Iterator for CynthionCapture {
             if let Some(item) = self.parser.next_item() {
                 return Some(Ok(item));
             }
-            match self.reader.read(&mut self.scratch) {
-                Ok(0) => {
+            let Some(transfer) = self.reads.front().cloned() else {
+                self.done = true;
+                return None;
+            };
+            match transfer.wait(Some(READ_TIMEOUT)) {
+                Ok(TransferStatus::Completed) => {
+                    match transfer.data() {
+                        Ok(data) => self.parser.extend(&data),
+                        Err(e) => return Some(Err(self.fail(e))),
+                    }
+                    if let Err(e) = transfer.submit() {
+                        return Some(Err(self.fail(e)));
+                    }
+                    self.reads.rotate_left(1);
+                }
+                // Cancelled by `stop`/`drop`: the stream has ended.
+                Ok(TransferStatus::Cancelled) => {
                     self.done = true;
                     return None;
                 }
-                Ok(n) => {
-                    let chunk = self.scratch[..n].to_vec();
-                    self.parser.extend(&chunk);
+                Ok(status) => {
+                    let e = status.into_result().unwrap_err();
+                    return Some(Err(self.fail(e)));
                 }
-                // A read timeout just means no traffic arrived in this window.
+                // A wait timeout just means no traffic arrived in this window.
                 // End the stream if a stop was requested, otherwise keep waiting.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
+                Err(e) if e.is_timeout() => {
                     if self.stop.load(Ordering::Relaxed) {
                         self.done = true;
                         return None;
                     }
                 }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e.into()));
-                }
+                Err(e) => return Some(Err(self.fail(e))),
             }
+        }
+    }
+}
+
+impl CynthionCapture {
+    /// End the stream on a USB error, returning it for the caller to report.
+    fn fail(&mut self, e: rawusb::Error) -> Error {
+        self.done = true;
+        e.into()
+    }
+
+    /// Abort every bulk read still in flight.
+    fn cancel_reads(&mut self) {
+        for transfer in self.reads.drain(..) {
+            let _ = transfer.cancel();
+            let _ = transfer.wait(None);
         }
     }
 }
@@ -288,7 +306,9 @@ impl CaptureSource for CynthionCapture {
         }
         self.stopped = true;
         self.stop.store(true, Ordering::Relaxed);
-        write_state(&self.interface, self.iface_num, self.stop_state)
+        let result = write_state(&self.interface, self.iface_num, self.stop_state);
+        self.cancel_reads();
+        result
     }
 
     fn stop_handle(&self) -> StopFn {
@@ -310,41 +330,32 @@ impl Drop for CynthionCapture {
 }
 
 /// Read a one-byte vendor register from the analyzer interface.
-fn read_register(interface: &Interface, iface_num: u8, request: u8) -> Result<u8> {
-    let data = interface
-        .control_in(
-            ControlIn {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Interface,
-                request,
-                value: 0,
-                index: iface_num as u16,
-                length: 64,
-            },
-            TIMEOUT,
-        )
-        .wait()?;
+fn read_register(interface: &DeviceHandle, iface_num: u8, request: u8) -> Result<u8> {
+    let data = usb::vendor_in(
+        interface,
+        Recipient::Interface,
+        request,
+        0,
+        iface_num as u16,
+        64,
+        TIMEOUT,
+    )?;
     data.first()
         .copied()
         .ok_or_else(|| Error::Protocol(format!("empty response to request {request}")))
 }
 
 /// Write the analyzer State register.
-fn write_state(interface: &Interface, iface_num: u8, state: u8) -> Result<()> {
-    interface
-        .control_out(
-            ControlOut {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Interface,
-                request: REQ_SET_STATE,
-                value: state as u16,
-                index: iface_num as u16,
-                data: &[],
-            },
-            TIMEOUT,
-        )
-        .wait()?;
-    Ok(())
+fn write_state(interface: &DeviceHandle, iface_num: u8, state: u8) -> Result<()> {
+    usb::vendor_out(
+        interface,
+        Recipient::Interface,
+        REQ_SET_STATE,
+        state as u16,
+        iface_num as u16,
+        &[],
+        TIMEOUT,
+    )
 }
 
 /// Decode the supported-speeds bitmask into a list of speeds.
